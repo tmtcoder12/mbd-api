@@ -10,4 +10,4 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
 EXPOSE 8000
-CMD ["python3", "backend/rag-chatbot.py", "serve", "8", "8000"]
+CMD ["sh", "-c", "python3 rag-chatbot.py serve 8 ${PORT:-8000}"]
