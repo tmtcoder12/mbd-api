@@ -113,6 +113,20 @@ class SupabaseStore:
         )
         return isinstance(data, list) and len(data) > 0
 
+    def get_restaurant_system_prompt(self, restaurant_id: str) -> Optional[str]:
+        rid = self._require_uuid(restaurant_id, "restaurant_id")
+        data = self._request(
+            "GET",
+            "/rest/v1/restaurants",
+            query={"select": "system_prompt", "id": f"eq.{rid}", "limit": "1"},
+        )
+        if isinstance(data, list) and data:
+            value = data[0].get("system_prompt")
+            if isinstance(value, str):
+                text = value.strip()
+                return text or None
+        return None
+
     def origin_exists(self, origin: str) -> bool:
         normalized = self._normalize_origin(origin)
         if not normalized:
