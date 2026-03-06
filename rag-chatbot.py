@@ -1,14 +1,10 @@
 """
 RAG chatbot with streaming web API.
 
-CLI mode (FAISS default):
-  python rag-chatbot.py rag/faiss.index rag/chunks_meta.json [top_k]
-
 Web server mode:
-  python rag-chatbot.py serve [index_path] [meta_path] [top_k] [port]
+  python rag-chatbot.py serve [top_k] [port]
 
 Environment flags:
-  RETRIEVAL_BACKEND=faiss|supabase   (default: faiss)
   CHAT_PERSISTENCE=true|false        (default: true)
   SUPABASE_URL=...
   SUPABASE_SERVICE_ROLE_KEY=...
@@ -38,10 +34,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from supabase_store import SupabaseStore, SupabaseStoreError
-try:
-    import faiss
-except ModuleNotFoundError:
-    faiss = None
 try:
     import redis
 except ModuleNotFoundError:
@@ -236,10 +228,6 @@ def build_widget_token(
     return token, exp
 
 
-def resolve_input_path(path_str: str) -> str:
-    return path_str
-
-
 def parse_bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -270,41 +258,13 @@ def normalize_restaurant_id(restaurant_id: str) -> str:
         raise ValueError("restaurantId must be a valid UUID") from exc
 
 
-def load_index_and_meta(index_path: str, meta_path: str):
-    if faiss is None:
-        raise RuntimeError("faiss is required for RETRIEVAL_BACKEND=faiss")
-    resolved_index = resolve_input_path(index_path)
-    resolved_meta = resolve_input_path(meta_path)
-    index = faiss.read_index(str(resolved_index))
-    metas = json.loads(resolved_meta.read_text(encoding="utf-8"))
-    return index, metas
-
-
 def embed_query(client: OpenAI, text: str) -> np.ndarray:
     resp = client.embeddings.create(model=EMBED_MODEL, input=[text])
     v = np.array(resp.data[0].embedding, dtype=np.float32)
     v = v.reshape(1, -1)
-    if faiss is not None:
-        faiss.normalize_L2(v)
-    else:
-        norm = np.linalg.norm(v, axis=1, keepdims=True)
-        v = v / np.clip(norm, 1e-12, None)
+    norm = np.linalg.norm(v, axis=1, keepdims=True)
+    v = v / np.clip(norm, 1e-12, None)
     return v
-
-
-def faiss_search(index, metas: List[Dict[str, Any]], qvec: np.ndarray, top_k: int) -> List[Dict[str, Any]]:
-    if faiss is None:
-        raise RuntimeError("faiss is required for RETRIEVAL_BACKEND=faiss")
-    scores, ids = index.search(qvec, top_k)
-    results = []
-    for score, idx in zip(scores[0], ids[0]):
-        if idx == -1:
-            continue
-        m = metas[idx].copy()
-        m["score"] = float(score)
-        m["id"] = m.get("id")
-        results.append(m)
-    return results
 
 
 def build_context(results: List[Dict[str, Any]]) -> str:
@@ -355,14 +315,8 @@ def stream_llm_deltas(client: OpenAI, prompt: str) -> Generator[str, None, None]
 class Retriever:
     def __init__(
         self,
-        backend: str,
-        faiss_index=None,
-        faiss_metas: Optional[List[Dict[str, Any]]] = None,
-        supabase_store: Optional[SupabaseStore] = None,
+        supabase_store: SupabaseStore,
     ):
-        self.backend = backend
-        self.faiss_index = faiss_index
-        self.faiss_metas = faiss_metas or []
         self.supabase_store = supabase_store
 
     def retrieve(
@@ -377,34 +331,27 @@ class Retriever:
         qvec = embed_query(client, user_q)
         t1 = time.perf_counter()
 
-        if self.backend == "supabase":
-            if self.supabase_store is None:
-                raise RuntimeError("Supabase store is not configured")
-            if not restaurant_id:
-                raise RuntimeError("restaurantId is required for RETRIEVAL_BACKEND=supabase")
-            rows = self.supabase_store.match_chunks(
-                restaurant_id,
-                qvec[0].tolist(),
-                match_count=top_k,
-                min_score=min_score,
+        if not restaurant_id:
+            raise RuntimeError("restaurantId is required for retrieval")
+        rows = self.supabase_store.match_chunks(
+            restaurant_id,
+            qvec[0].tolist(),
+            match_count=top_k,
+            min_score=min_score,
+        )
+        results = []
+        for row in rows:
+            results.append(
+                {
+                    "id": row.get("id"),
+                    "text": row.get("text", ""),
+                    "type": row.get("type", ""),
+                    "source_url": row.get("source_url", ""),
+                    "page_path": row.get("page_path", ""),
+                    "title": row.get("title", ""),
+                    "score": float(row.get("score") or 0.0),
+                }
             )
-            results = []
-            for row in rows:
-                results.append(
-                    {
-                        "id": row.get("id"),
-                        "text": row.get("text", ""),
-                        "type": row.get("type", ""),
-                        "source_url": row.get("source_url", ""),
-                        "page_path": row.get("page_path", ""),
-                        "title": row.get("title", ""),
-                        "score": float(row.get("score") or 0.0),
-                    }
-                )
-        else:
-            results = faiss_search(self.faiss_index, self.faiss_metas, qvec, top_k=top_k)
-            if min_score > 0.0:
-                results = [r for r in results if float(r.get("score", 0.0)) >= min_score]
 
         t2 = time.perf_counter()
         results_for_llm = results[:MAX_SOURCES_SENT]
@@ -417,7 +364,7 @@ class Retriever:
             prep_ms = (t3 - t2) * 1000
             top_score = float(results[0]["score"]) if results else 0.0
             print(
-                f"[debug] backend={self.backend} top_score={top_score:.3f} | "
+                f"[debug] backend=supabase top_score={top_score:.3f} | "
                 f"embed={embed_ms:.1f}ms search={search_ms:.1f}ms prep={prep_ms:.1f}ms"
             )
 
@@ -880,7 +827,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             if DEBUG_TIMINGS:
                 elapsed_ms = (time.perf_counter() - prep["timing_start"]) * 1000
                 print(
-                    f"[debug] web request complete | backend={self.retriever.backend} "
+                    f"[debug] web request complete | backend=supabase "
                     f"first_token={first_token_sent} total={elapsed_ms:.1f}ms"
                 )
             log_event(
@@ -928,46 +875,6 @@ class ChatHandler(BaseHTTPRequestHandler):
             )
 
 
-def main(index_path: str, meta_path: str, top_k: int = 8):
-    load_dotenv()
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    index, metas = load_index_and_meta(index_path, meta_path)
-    retriever = Retriever(backend="faiss", faiss_index=index, faiss_metas=metas)
-
-    print("✅ RAG chatbot ready. Type 'exit' to quit.\\n")
-    if DEBUG_TIMINGS:
-        print(
-            f"[debug] tuneables -> backend=faiss top_k={top_k} | MAX_SOURCES_SENT={MAX_SOURCES_SENT} | "
-            f"MIN_SCORE_DEFAULT={MIN_SCORE_DEFAULT} | model={CHAT_MODEL}\\n"
-        )
-
-    while True:
-        user_q = input("You: ").strip()
-        if not user_q:
-            continue
-        if user_q.lower() in {"exit", "quit"}:
-            break
-
-        prep = retriever.retrieve(client, user_q, top_k, MIN_SCORE_DEFAULT)
-        prompt = prep["prompt"]
-        t3 = time.perf_counter()
-
-        print("\\nAssistant: ", end="", flush=True)
-        collected = []
-        for delta in stream_llm_deltas(client, prompt):
-            print(delta, end="", flush=True)
-            collected.append(delta)
-        print("\\n")
-
-        t4 = time.perf_counter()
-        if DEBUG_TIMINGS:
-            llm_ms = (t4 - t3) * 1000
-            total_ms = (t4 - prep["timing_start"]) * 1000
-            results = prep["results"]
-            top_score = float(results[0]["score"]) if results else 0.0
-            print(f"[debug] top_score={top_score:.3f} | llm={llm_ms:.1f}ms total={total_ms:.1f}ms\\n")
-
-
 def make_supabase_store_if_configured() -> Optional[SupabaseStore]:
     supabase_url = os.getenv("SUPABASE_URL", "").strip()
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -976,11 +883,10 @@ def make_supabase_store_if_configured() -> Optional[SupabaseStore]:
     return SupabaseStore(supabase_url, service_key)
 
 
-def serve(index_path: str, meta_path: str, top_k: int = 8, port: int = 8000):
+def serve(top_k: int = 8, port: int = 8000):
     load_dotenv()
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    retrieval_backend = os.getenv("RETRIEVAL_BACKEND", "faiss").strip().lower()
     persist_chat = parse_bool_env("CHAT_PERSISTENCE", True)
     min_score = float(os.getenv("MIN_SCORE_DEFAULT", str(MIN_SCORE_DEFAULT)))
     rate_limit_rpm = int(os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "30"))
@@ -1006,16 +912,9 @@ def serve(index_path: str, meta_path: str, top_k: int = 8, port: int = 8000):
 
     store = make_supabase_store_if_configured()
 
-    if retrieval_backend not in {"faiss", "supabase"}:
-        raise SystemExit("RETRIEVAL_BACKEND must be 'faiss' or 'supabase'")
-
-    if retrieval_backend == "supabase":
-        if store is None:
-            raise SystemExit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for RETRIEVAL_BACKEND=supabase")
-        retriever = Retriever(backend="supabase", supabase_store=store)
-    else:
-        index, metas = load_index_and_meta(index_path, meta_path)
-        retriever = Retriever(backend="faiss", faiss_index=index, faiss_metas=metas)
+    if store is None:
+        raise SystemExit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
+    retriever = Retriever(supabase_store=store)
 
     if persist_chat and store is None:
         raise SystemExit("CHAT_PERSISTENCE=true requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
@@ -1045,7 +944,7 @@ def serve(index_path: str, meta_path: str, top_k: int = 8, port: int = 8000):
 
     server = ThreadingHTTPServer(("0.0.0.0", port), ChatHandler)
     print(f"✅ Chat server running at http://localhost:{port}")
-    print(f"   - Retrieval backend: {retrieval_backend}")
+    print("   - Retrieval backend: supabase")
     print(f"   - Chat persistence: {'enabled' if persist_chat else 'disabled'}")
     print("   - Stream API: POST /api/chat-stream")
     print("   - Token API: POST /api/widget-token")
@@ -1071,31 +970,17 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) >= 2 and sys.argv[1] == "serve":
-        # Backward compatible positional parsing:
-        # 1) serve index meta [top_k] [port]
-        # 2) serve [top_k] [port]
-        index_path = "rag/faiss.index"
-        meta_path = "rag/chunks_meta.json"
         top_k = 8
         port = 8000
 
-        if len(sys.argv) >= 4 and not sys.argv[2].isdigit() and not sys.argv[3].isdigit():
-            index_path = sys.argv[2]
-            meta_path = sys.argv[3]
-            top_k = int(sys.argv[4]) if len(sys.argv) >= 5 else 8
-            port = int(sys.argv[5]) if len(sys.argv) >= 6 else 8000
-        elif len(sys.argv) >= 3:
+        if len(sys.argv) >= 3:
             top_k = int(sys.argv[2])
             port = int(sys.argv[3]) if len(sys.argv) >= 4 else 8000
 
-        serve(index_path, meta_path, top_k=top_k, port=port)
+        serve(top_k=top_k, port=port)
     else:
-        if len(sys.argv) < 3:
-            print("Usage: python rag-chatbot.py faiss.index chunks_meta.json [top_k]")
-            print("   or: python rag-chatbot.py serve [index meta] [top_k] [port]")
-            raise SystemExit(1)
-        top_k = int(sys.argv[3]) if len(sys.argv) >= 4 else 8
-        main(sys.argv[1], sys.argv[2], top_k=top_k)
+        print("Usage: python rag-chatbot.py serve [top_k] [port]")
+        raise SystemExit(1)
 
 
 '''
@@ -1103,7 +988,7 @@ The Logic Flow in this File:
 
 User Post: Receives JSON message + Session Token.Log to Supabase: Save the user's question.
 Embed: Turn the question into a vector ($1536$ dimensions).
-Retrieve: Find the top-k most similar text chunks (from FAISS or Supabase).
+Retrieve: Find the top-k most similar text chunks from Supabase.
 Construct Prompt: Wrap those chunks in your "Charismatic Restaurant Assistant" instructions.
 Stream: Pipe the LLM's words to the user's screen.
 Final Log to Supabase: Save the complete answer and the sources used.
