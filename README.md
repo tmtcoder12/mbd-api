@@ -199,3 +199,31 @@ curl http://localhost:8000/healthz
 - Request IDs are returned in `X-Request-Id`.
 - Debug timing logs are enabled (`DEBUG_TIMINGS = True` in code).
 - The `Dockerfile` currently starts `backend/rag-chatbot.py`; in this repo layout, the script is at repo root (`rag-chatbot.py`), so update container command if needed.
+
+
+## Example Usage: 
+
+Health check: curl -i https://mbd-api.onrender.com/healthz
+
+Request Widget Token: 
+curl -sS -X POST https://mbd-api.onrender.com/api/widget-token \
+  -H "Content-Type: application/json" \
+  -H "Origin: http://localhost:8000" \ 
+  -d "{\"restaurantId\":\"$RID\"}"
+
+NOTE: In testing and dev, the origin will be local host. In production, that will be the restaurants website. 
+
+Call Chat Stream: 
+
+WIDGET_TOKEN="<paste token from step 2>"
+
+curl -N -X POST https://mbd-api.onrender.com/api/chat-stream \
+  -H "Content-Type: application/json" \
+  -H "Origin: $ORIGIN" \
+  -d "{
+    \"message\":\"What are your most popular dishes?\",
+    \"restaurantId\":\"$RID\",
+    \"widgetToken\":\"$WIDGET_TOKEN\"
+  }"
+
+
