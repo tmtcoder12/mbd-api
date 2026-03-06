@@ -1,4 +1,4 @@
 openai 
 numpy
-dotenv
+python-dotenv
 redis
