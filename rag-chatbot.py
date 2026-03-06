@@ -49,7 +49,7 @@ EMBED_DIM = 1536
 
 SESSION_TOKEN_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
-SYSTEM_INSTRUCTIONS = (
+DEFAULT_SYSTEM_INSTRUCTIONS = (
     "You are a helpful restaurant waiter. You goal is to be humourous, charismatic to persuade customers to try food here.\n"
     "Answer using the provided Sources.\n"
     "When you mention a menu item, include its price if present.\n"
@@ -285,11 +285,11 @@ def build_prompt(user_q: str, context: str) -> str:
     return f"User question:\n{user_q}\n\nSources:\n{context}"
 
 
-def stream_llm_deltas(client: OpenAI, prompt: str) -> Generator[str, None, None]:
+def stream_llm_deltas(client: OpenAI, prompt: str, system_instructions: str) -> Generator[str, None, None]:
     with client.responses.stream(
         model=CHAT_MODEL,
         input=[
-            {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_INSTRUCTIONS}]},
+            {"role": "system", "content": [{"type": "input_text", "text": system_instructions}]},
             {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
         ],
     ) as stream:
@@ -515,6 +515,18 @@ class ChatHandler(BaseHTTPRequestHandler):
             return None
         return settings
 
+    def _load_system_instructions(self, restaurant_id: str, request_id: str) -> Optional[str]:
+        if self.store is None:
+            return DEFAULT_SYSTEM_INSTRUCTIONS
+        try:
+            custom_prompt = self.store.get_restaurant_system_prompt(restaurant_id)
+        except SupabaseStoreError as exc:
+            self._send_json_error(502, f"Failed to load restaurant system_prompt: {exc}", request_id=request_id)
+            return None
+        if custom_prompt:
+            return custom_prompt
+        return DEFAULT_SYSTEM_INSTRUCTIONS
+
     def _origin_guard(self, restaurant_id: str, origin: str, request_id: str) -> bool:
         try:
             if not self._is_origin_allowed_for_restaurant(restaurant_id, origin):
@@ -732,6 +744,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(403, str(exc), request_id=request_id)
             return
 
+        system_instructions = self._load_system_instructions(restaurant_id, request_id)
+        if system_instructions is None:
+            return
+
         client_ip_hash = hash_client_ip(self._client_ip())
         ip_rate_key = f"rl:ip:{restaurant_id}:{client_ip_hash}"
         session_rate_key = f"rl:session:{restaurant_id}:{session_token}"
@@ -803,7 +819,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             results = prep["results"]
             first_token_sent = False
 
-            for delta in stream_llm_deltas(self.client, prompt):
+            for delta in stream_llm_deltas(self.client, prompt, system_instructions):
                 first_token_sent = True
                 assistant_text += delta
                 line = json.dumps({"type": "delta", "content": delta}, ensure_ascii=False) + "\n"
