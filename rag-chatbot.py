@@ -372,27 +372,23 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
             return obj.get(key)
         return getattr(obj, key, None)
 
-    def _extract_chat_content(message_obj: Any) -> str:
-        content = _read(message_obj, "content")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts: List[str] = []
-            for block in content:
-                if isinstance(block, str):
-                    if block.strip():
-                        parts.append(block.strip())
-                    continue
-                text = _read(block, "text")
-                if isinstance(text, str) and text.strip():
+    def extract_chat_text(resp):
+        # easiest case
+        if hasattr(resp, "output_text") and resp.output_text:
+            return resp.output_text.strip()
+
+        parts = []
+
+        for msg in getattr(resp, "output", []):
+            if msg.get("type") != "message":
+                continue
+
+            for block in msg.get("content", []):
+                text = block.get("text")
+                if isinstance(text, str):
                     parts.append(text.strip())
-                    continue
-                nested = _read(_read(block, "text"), "value") or _read(block, "output_text")
-                if isinstance(nested, str) and nested.strip():
-                    parts.append(nested.strip())
-            if parts:
-                return "\n".join(parts).strip()
-        return ""
+
+        return "\n".join(parts).strip()
 
     raw = ""
     finish_reason = None
@@ -401,7 +397,7 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
         first_choice = choices[0]
         finish_reason = _read(first_choice, "finish_reason")
         message = _read(first_choice, "message")
-        raw = _extract_chat_content(message)
+        raw = extract_chat_text(message)
         if not raw:
             alt_text = _read(first_choice, "text")
             if isinstance(alt_text, str) and alt_text.strip():
