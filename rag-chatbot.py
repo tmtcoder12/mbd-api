@@ -335,7 +335,7 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
             {"role": "system", "content": QUERY_CLASSIFIER_INSTRUCTIONS},
             {"role": "user", "content": user_query},
         ],
-        max_tokens=16
+        max_output_tokens=16
     )
 
     def _read(obj: Any, key: str) -> Any:
