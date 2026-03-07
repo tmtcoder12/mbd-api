@@ -358,26 +358,26 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
 
 def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str, Dict[str, Any]]:
     t0 = time.perf_counter()
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=model,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": QUERY_CLASSIFIER_INSTRUCTIONS}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_query}]},
+        messages=[
+            {"role": "system", "content": QUERY_CLASSIFIER_INSTRUCTIONS},
+            {"role": "user", "content": user_query},
         ],
-        max_output_tokens=16,
+        max_tokens=16,
+        temperature=0,
     )
-
-    def _read(obj: Any, key: str) -> Any:
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    raw = _extract_response_text(resp)
-    output = _read(resp, "output")
+    raw = ""
+    choices = getattr(resp, "choices", None)
+    if isinstance(choices, list) and choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None) if message is not None else None
+        if isinstance(content, str):
+            raw = content.strip()
     meta = {
-        "response_id": _read(resp, "id"),
-        "has_output_text": bool((_read(resp, "output_text") or "").strip() if isinstance(_read(resp, "output_text"), str) else False),
-        "output_items_count": len(output) if isinstance(output, list) else None,
+        "response_id": getattr(resp, "id", None),
+        "has_output_text": bool(raw),
+        "output_items_count": len(choices) if isinstance(choices, list) else None,
         "raw_output_len": len(raw or ""),
         "latency_ms": int((time.perf_counter() - t0) * 1000),
     }
