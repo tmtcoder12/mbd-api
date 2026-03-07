@@ -119,6 +119,7 @@ Streaming event types:
 ### Retrieval tuning
 
 - `MIN_SCORE_DEFAULT` (default `0.0`)
+- `QUERY_CLASSIFIER_MODEL` (default `gpt-5-mini`)
 
 ### Origin policy
 
@@ -153,6 +154,7 @@ Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.
 - audit events
 - session upsert
 - chat message persistence
+- async query classification writeback (`chat_messages.query_type`)
 - vector retrieval (`match_chunks`)
 - ingest run/chunk upserts (utility methods)
 
@@ -225,5 +227,4 @@ curl -N -X POST https://mbd-api.onrender.com/api/chat-stream \
     \"restaurantId\":\"$RID\",
     \"widgetToken\":\"$WIDGET_TOKEN\"
   }"
-
 
