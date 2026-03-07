@@ -42,6 +42,7 @@ except ModuleNotFoundError:
 
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-5-mini"
+QUERY_CLASSIFIER_MODEL_DEFAULT = "gpt-5-mini"
 MAX_SOURCES_SENT = 4
 MIN_SCORE_DEFAULT = 0.0
 DEBUG_TIMINGS = True
@@ -55,6 +56,20 @@ DEFAULT_SYSTEM_INSTRUCTIONS = (
     "When you mention a menu item, include its price if present.\n"
     "Keep answers brief.\n"
     "Do not invent items, prices, or details, and do not ask follow up questions"
+)
+
+QUERY_TYPE_LABELS = (
+    "Operations",
+    "Dietary",
+    "Events",
+    "Menu",
+    "Transactions",
+)
+
+QUERY_CLASSIFIER_INSTRUCTIONS = (
+    "Classify the user's restaurant query into exactly one category.\n"
+    "Allowed labels: Operations, Dietary, Events, Menu, Transactions.\n"
+    "Return exactly one label and no other text."
 )
 
 
@@ -285,6 +300,49 @@ def build_prompt(user_q: str, context: str) -> str:
     return f"User question:\n{user_q}\n\nSources:\n{context}"
 
 
+def _extract_response_text(resp: Any) -> str:
+    out = getattr(resp, "output_text", None)
+    if isinstance(out, str) and out.strip():
+        return out.strip()
+
+    output = getattr(resp, "output", None)
+    if isinstance(output, list):
+        parts: List[str] = []
+        for item in output:
+            content = getattr(item, "content", None)
+            if isinstance(content, list):
+                for block in content:
+                    text = getattr(block, "text", None)
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+        if parts:
+            return "\n".join(parts).strip()
+    return ""
+
+
+def normalize_query_type_label(raw: str) -> Optional[str]:
+    value = (raw or "").strip().strip("\"'`")
+    if not value:
+        return None
+    first_line = value.splitlines()[0].strip()
+    for label in QUERY_TYPE_LABELS:
+        if first_line.lower() == label.lower():
+            return label
+    return None
+
+
+def classify_query_type(client: OpenAI, model: str, user_query: str) -> Optional[str]:
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": QUERY_CLASSIFIER_INSTRUCTIONS}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_query}]},
+        ],
+        max_output_tokens=16,
+    )
+    return normalize_query_type_label(_extract_response_text(resp))
+
+
 def stream_llm_deltas(client: OpenAI, prompt: str, system_instructions: str) -> Generator[str, None, None]:
     with client.responses.stream(
         model=CHAT_MODEL,
@@ -395,6 +453,7 @@ class ChatHandler(BaseHTTPRequestHandler):
     default_token_issue_max_requests: int = 30
     default_token_issue_window_seconds: int = 60
     default_token_max_age_seconds: int = 900
+    query_classifier_model: str = QUERY_CLASSIFIER_MODEL_DEFAULT
     _cors_origin: Optional[str] = None
 
     def end_headers(self):
@@ -526,6 +585,62 @@ class ChatHandler(BaseHTTPRequestHandler):
         if custom_prompt:
             return custom_prompt
         return DEFAULT_SYSTEM_INSTRUCTIONS
+
+    def _schedule_query_type_classification(
+        self,
+        message_id: Optional[str],
+        user_query: str,
+        restaurant_id: str,
+        request_id: str,
+    ) -> None:
+        if not message_id or self.store is None:
+            return
+
+        client = self.client
+        store = self.store
+        model = self.query_classifier_model
+
+        def _worker():
+            t0 = time.perf_counter()
+            log_event(
+                "query_classification_start",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                message_id=message_id,
+                model=model,
+            )
+            try:
+                label = classify_query_type(client, model, user_query)
+                if label is None:
+                    log_event(
+                        "query_classification_failed",
+                        request_id=request_id,
+                        restaurant_id=restaurant_id,
+                        message_id=message_id,
+                        reason="invalid_label",
+                        latency_ms=int((time.perf_counter() - t0) * 1000),
+                    )
+                    return
+                store.update_message_query_type(message_id, label)
+                log_event(
+                    "query_classification_complete",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    message_id=message_id,
+                    query_type=label,
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    "query_classification_failed",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    message_id=message_id,
+                    error=str(exc),
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _origin_guard(self, restaurant_id: str, origin: str, request_id: str) -> bool:
         try:
@@ -772,6 +887,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
 
         session_id = None
+        user_message_id = None
         if self.persist_chat:
             if self.store is None:
                 self._send_json_error(
@@ -782,7 +898,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return
             try:
                 session_id = self.store.upsert_session(restaurant_id, session_token, self._extract_client_meta())
-                self.store.insert_message(session_id, "user", user_msg)
+                user_row = self.store.insert_message(session_id, "user", user_msg, return_row=True)
+                if user_row is not None:
+                    row_id = user_row.get("id")
+                    if row_id:
+                        user_message_id = str(row_id)
             except SupabaseStoreError as exc:
                 self._send_json_error(502, f"Failed to persist chat session: {exc}", request_id=request_id)
                 return
@@ -829,6 +949,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._write_chunk(done_line)
             self._end_chunked()
 
+            self._schedule_query_type_classification(
+                user_message_id,
+                user_msg,
+                restaurant_id=restaurant_id,
+                request_id=request_id,
+            )
+
             if self.persist_chat and session_id is not None:
                 latency_ms = int((time.perf_counter() - prep["timing_start"]) * 1000)
                 self.store.insert_message(
@@ -863,6 +990,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self._end_chunked()
             except Exception:  # noqa: BLE001
                 pass
+
+            self._schedule_query_type_classification(
+                user_message_id,
+                user_msg,
+                restaurant_id=restaurant_id,
+                request_id=request_id,
+            )
 
             if self.persist_chat and session_id is not None:
                 try:
@@ -916,6 +1050,7 @@ def serve(top_k: int = 8, port: int = 8000):
     redis_rate_limit_url = (os.getenv("RATE_LIMIT_REDIS_URL") or "").strip()
     signing_keys_raw = os.getenv("WIDGET_SIGNING_KEYS", "").strip()
     widget_active_kid = (os.getenv("WIDGET_ACTIVE_KID") or "v1").strip()
+    query_classifier_model = (os.getenv("QUERY_CLASSIFIER_MODEL") or QUERY_CLASSIFIER_MODEL_DEFAULT).strip()
     try:
         widget_signing_keys = parse_signing_keys(signing_keys_raw)
     except ValueError as exc:
@@ -957,6 +1092,7 @@ def serve(top_k: int = 8, port: int = 8000):
     ChatHandler.default_token_issue_max_requests = token_issue_rate_limit_rpm
     ChatHandler.default_token_issue_window_seconds = token_issue_rate_limit_window_s
     ChatHandler.default_token_max_age_seconds = token_max_age_s
+    ChatHandler.query_classifier_model = query_classifier_model
 
     server = ThreadingHTTPServer(("0.0.0.0", port), ChatHandler)
     print(f"✅ Chat server running at http://localhost:{port}")
@@ -979,6 +1115,7 @@ def serve(top_k: int = 8, port: int = 8000):
     print(f"   - Redis limiter: {'enabled' if redis_rate_limit_url else 'disabled (in-memory fallback)'}")
     print(f"   - Signing keys loaded: {len(widget_signing_keys)}")
     print(f"   - Active widget key id: {widget_active_kid}")
+    print(f"   - Query classifier model: {query_classifier_model}")
     server.serve_forever()
 
 
