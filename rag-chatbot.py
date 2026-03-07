@@ -346,7 +346,7 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
     return None
 
 
-def classify_query_type(client: OpenAI, model: str, user_query: str) -> Optional[str]:
+def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str]:
     resp = client.responses.create(
         model=model,
         input=[
@@ -355,7 +355,8 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Optional
         ],
         max_output_tokens=16,
     )
-    return normalize_query_type_label(_extract_response_text(resp))
+    raw = _extract_response_text(resp)
+    return normalize_query_type_label(raw), raw
 
 
 def stream_llm_deltas(client: OpenAI, prompt: str, system_instructions: str) -> Generator[str, None, None]:
@@ -625,7 +626,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 model=model,
             )
             try:
-                label = classify_query_type(client, model, user_query)
+                label, raw_label_output = classify_query_type(client, model, user_query)
                 if label is None:
                     log_event(
                         "query_classification_failed",
@@ -633,6 +634,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         restaurant_id=restaurant_id,
                         message_id=message_id,
                         reason="invalid_label",
+                        raw_output=(raw_label_output or "")[:200],
                         latency_ms=int((time.perf_counter() - t0) * 1000),
                     )
                     return
