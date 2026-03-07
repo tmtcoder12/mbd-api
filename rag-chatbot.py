@@ -366,17 +366,51 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
         ],
         max_completion_tokens=16
     )
-    raw = ""
-    choices = getattr(resp, "choices", None)
-    if isinstance(choices, list) and choices:
-        message = getattr(choices[0], "message", None)
-        content = getattr(message, "content", None) if message is not None else None
+
+    def _read(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def _extract_chat_content(message_obj: Any) -> str:
+        content = _read(message_obj, "content")
         if isinstance(content, str):
-            raw = content.strip()
+            return content.strip()
+        if isinstance(content, list):
+            parts: List[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    if block.strip():
+                        parts.append(block.strip())
+                    continue
+                text = _read(block, "text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+                    continue
+                nested = _read(_read(block, "text"), "value") or _read(block, "output_text")
+                if isinstance(nested, str) and nested.strip():
+                    parts.append(nested.strip())
+            if parts:
+                return "\n".join(parts).strip()
+        return ""
+
+    raw = ""
+    finish_reason = None
+    choices = _read(resp, "choices")
+    if isinstance(choices, list) and choices:
+        first_choice = choices[0]
+        finish_reason = _read(first_choice, "finish_reason")
+        message = _read(first_choice, "message")
+        raw = _extract_chat_content(message)
+        if not raw:
+            alt_text = _read(first_choice, "text")
+            if isinstance(alt_text, str) and alt_text.strip():
+                raw = alt_text.strip()
     meta = {
-        "response_id": getattr(resp, "id", None),
+        "response_id": _read(resp, "id"),
         "has_output_text": bool(raw),
         "output_items_count": len(choices) if isinstance(choices, list) else None,
+        "finish_reason": finish_reason,
         "raw_output_len": len(raw or ""),
         "latency_ms": int((time.perf_counter() - t0) * 1000),
     }
@@ -669,6 +703,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     response_id=meta.get("response_id"),
                     has_output_text=meta.get("has_output_text"),
                     output_items_count=meta.get("output_items_count"),
+                    finish_reason=meta.get("finish_reason"),
                     raw_output_len=meta.get("raw_output_len"),
                     llm_latency_ms=meta.get("latency_ms"),
                 )
