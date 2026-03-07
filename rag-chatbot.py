@@ -300,36 +300,6 @@ def build_prompt(user_q: str, context: str) -> str:
     return f"User question:\n{user_q}\n\nSources:\n{context}"
 
 
-def _extract_response_text(resp: Any) -> str:
-    def _read(obj: Any, key: str) -> Any:
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    out = _read(resp, "output_text")
-    if isinstance(out, str) and out.strip():
-        return out.strip()
-
-    output = _read(resp, "output")
-    if isinstance(output, list):
-        parts: List[str] = []
-        for item in output:
-            content = _read(item, "content")
-            if isinstance(content, list):
-                for block in content:
-                    text = _read(block, "text")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text.strip())
-                        continue
-                    # Some SDK payloads wrap text in nested fields.
-                    nested = _read(block, "output_text") or _read(_read(block, "text"), "value")
-                    if isinstance(nested, str) and nested.strip():
-                        parts.append(nested.strip())
-        if parts:
-            return "\n".join(parts).strip()
-    return ""
-
-
 def normalize_query_type_label(raw: str) -> Optional[str]:
     value = (raw or "").strip().strip("\"'`")
     if not value:
@@ -358,13 +328,14 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
 
 def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str, Dict[str, Any]]:
     t0 = time.perf_counter()
-    resp = client.chat.completions.create(
+
+    resp = client.responses.create(
         model=model,
-        messages=[
+        input=[
             {"role": "system", "content": QUERY_CLASSIFIER_INSTRUCTIONS},
             {"role": "user", "content": user_query},
         ],
-        max_completion_tokens=16
+        max_tokens=16
     )
 
     def _read(obj: Any, key: str) -> Any:
@@ -372,46 +343,43 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
             return obj.get(key)
         return getattr(obj, key, None)
 
-    def extract_chat_text(resp):
-        # easiest case
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
+    def extract_chat_text(resp_obj: Any) -> str:
+        # easiest case for Responses API
+        output_text = _read(resp_obj, "output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
 
-        parts = []
+        parts: List[str] = []
 
-        for msg in getattr(resp, "output", []):
-            if msg.get("type") != "message":
-                continue
+        output = _read(resp_obj, "output")
+        if isinstance(output, list):
+            for msg in output:
+                msg_type = _read(msg, "type")
+                if msg_type != "message":
+                    continue
 
-            for block in msg.get("content", []):
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text.strip())
+                content = _read(msg, "content")
+                if not isinstance(content, list):
+                    continue
+
+                for block in content:
+                    text = _read(block, "text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
 
         return "\n".join(parts).strip()
 
-    raw = ""
-    finish_reason = None
-    choices = _read(resp, "choices")
-    if isinstance(choices, list) and choices:
-        first_choice = choices[0]
-        finish_reason = _read(first_choice, "finish_reason")
-        message = _read(first_choice, "message")
-        raw = extract_chat_text(message)
-        if not raw:
-            alt_text = _read(first_choice, "text")
-            if isinstance(alt_text, str) and alt_text.strip():
-                raw = alt_text.strip()
+    raw = extract_chat_text(resp)
+
     meta = {
         "response_id": _read(resp, "id"),
         "has_output_text": bool(raw),
-        "output_items_count": len(choices) if isinstance(choices, list) else None,
-        "finish_reason": finish_reason,
+        "output_items_count": len(_read(resp, "output")) if isinstance(_read(resp, "output"), list) else None,
         "raw_output_len": len(raw or ""),
         "latency_ms": int((time.perf_counter() - t0) * 1000),
     }
-    return normalize_query_type_label(raw), raw, meta
 
+    return normalize_query_type_label(raw), raw, meta
 
 def stream_llm_deltas(client: OpenAI, prompt: str, system_instructions: str) -> Generator[str, None, None]:
     with client.responses.stream(
