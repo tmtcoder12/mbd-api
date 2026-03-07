@@ -245,7 +245,9 @@ class SupabaseStore:
         sources: Optional[List[Dict[str, Any]]] = None,
         latency_ms: Optional[int] = None,
         delivery_status: str = "complete",
-    ) -> None:
+        query_type: Optional[str] = None,
+        return_row: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         payload = {
             "session_id": session_id,
             "role": role,
@@ -253,11 +255,35 @@ class SupabaseStore:
             "sources": sources if sources is not None else None,
             "latency_ms": latency_ms,
             "delivery_status": delivery_status,
+            "query_type": query_type,
         }
-        self._request(
+        data = self._request(
             "POST",
             "/rest/v1/chat_messages",
             payload=[payload],
+            prefer="return=representation" if return_row else "return=minimal",
+        )
+        if not return_row:
+            return None
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        if isinstance(data, dict):
+            return data
+        raise SupabaseStoreError("insert_message did not return row data")
+
+    def update_message_query_type(self, message_id: str, query_type: str) -> None:
+        mid = self._require_uuid(message_id, "message_id")
+        qtype = (query_type or "").strip()
+        if not qtype:
+            raise SupabaseStoreError("query_type is required")
+        payload = {"query_type": qtype}
+        self._request(
+            "PATCH",
+            "/rest/v1/chat_messages",
+            payload=payload,
+            query={"id": f"eq.{mid}"},
             prefer="return=minimal",
         )
 
