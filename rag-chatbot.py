@@ -301,20 +301,30 @@ def build_prompt(user_q: str, context: str) -> str:
 
 
 def _extract_response_text(resp: Any) -> str:
-    out = getattr(resp, "output_text", None)
+    def _read(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    out = _read(resp, "output_text")
     if isinstance(out, str) and out.strip():
         return out.strip()
 
-    output = getattr(resp, "output", None)
+    output = _read(resp, "output")
     if isinstance(output, list):
         parts: List[str] = []
         for item in output:
-            content = getattr(item, "content", None)
+            content = _read(item, "content")
             if isinstance(content, list):
                 for block in content:
-                    text = getattr(block, "text", None)
+                    text = _read(block, "text")
                     if isinstance(text, str) and text.strip():
                         parts.append(text.strip())
+                        continue
+                    # Some SDK payloads wrap text in nested fields.
+                    nested = _read(block, "output_text") or _read(_read(block, "text"), "value")
+                    if isinstance(nested, str) and nested.strip():
+                        parts.append(nested.strip())
         if parts:
             return "\n".join(parts).strip()
     return ""
