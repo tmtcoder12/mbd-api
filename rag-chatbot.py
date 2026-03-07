@@ -324,10 +324,25 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
     value = (raw or "").strip().strip("\"'`")
     if not value:
         return None
+
+    def _clean(s: str) -> str:
+        return re.sub(r"[^a-z]+", "", s.lower())
+
     first_line = value.splitlines()[0].strip()
+    first_line_clean = _clean(first_line)
     for label in QUERY_TYPE_LABELS:
-        if first_line.lower() == label.lower():
+        if first_line_clean == _clean(label):
             return label
+
+    # Fallback: accept when the full output mentions exactly one allowed label.
+    lowered = value.lower()
+    matches = [
+        label
+        for label in QUERY_TYPE_LABELS
+        if re.search(rf"\b{re.escape(label.lower())}\b", lowered)
+    ]
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
