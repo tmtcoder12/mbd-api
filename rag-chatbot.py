@@ -364,7 +364,7 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
             {"role": "system", "content": QUERY_CLASSIFIER_INSTRUCTIONS},
             {"role": "user", "content": user_query},
         ],
-        max_tokens=16,
+        max_completion_tokens=16,
         temperature=0,
     )
     raw = ""
