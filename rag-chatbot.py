@@ -356,7 +356,8 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
     return None
 
 
-def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str]:
+def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str, Dict[str, Any]]:
+    t0 = time.perf_counter()
     resp = client.responses.create(
         model=model,
         input=[
@@ -365,8 +366,22 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
         ],
         max_output_tokens=16,
     )
+
+    def _read(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
     raw = _extract_response_text(resp)
-    return normalize_query_type_label(raw), raw
+    output = _read(resp, "output")
+    meta = {
+        "response_id": _read(resp, "id"),
+        "has_output_text": bool((_read(resp, "output_text") or "").strip() if isinstance(_read(resp, "output_text"), str) else False),
+        "output_items_count": len(output) if isinstance(output, list) else None,
+        "raw_output_len": len(raw or ""),
+        "latency_ms": int((time.perf_counter() - t0) * 1000),
+    }
+    return normalize_query_type_label(raw), raw, meta
 
 
 def stream_llm_deltas(client: OpenAI, prompt: str, system_instructions: str) -> Generator[str, None, None]:
@@ -635,8 +650,29 @@ class ChatHandler(BaseHTTPRequestHandler):
                 message_id=message_id,
                 model=model,
             )
+            log_event(
+                "query_classification_llm_request",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                message_id=message_id,
+                model=model,
+                query_preview=user_query[:120],
+                prompt_hash=hashlib.sha256(QUERY_CLASSIFIER_INSTRUCTIONS.encode("utf-8")).hexdigest()[:16],
+            )
             try:
-                label, raw_label_output = classify_query_type(client, model, user_query)
+                label, raw_label_output, meta = classify_query_type(client, model, user_query)
+                log_event(
+                    "query_classification_llm_response",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    message_id=message_id,
+                    model=model,
+                    response_id=meta.get("response_id"),
+                    has_output_text=meta.get("has_output_text"),
+                    output_items_count=meta.get("output_items_count"),
+                    raw_output_len=meta.get("raw_output_len"),
+                    llm_latency_ms=meta.get("latency_ms"),
+                )
                 if label is None:
                     log_event(
                         "query_classification_failed",
