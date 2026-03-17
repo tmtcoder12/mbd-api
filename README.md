@@ -153,6 +153,7 @@ Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.
 - security settings lookup
 - audit events
 - session upsert
+- session state persistence (`chat_session_state`)
 - chat message persistence
 - async query classification writeback (`chat_messages.query_type`)
 - vector retrieval (`match_chunks`)
@@ -164,8 +165,17 @@ Expected backend tables/RPC include (at minimum):
 - `restaurant_allowed_origins`
 - `restaurant_security_settings`
 - `audit_events`
+- `chat_session_state`
 - `chat_messages`
 - RPC: `upsert_session`, `match_chunks`
+
+## Session State Schema
+
+Apply migration:
+
+```bash
+psql "$DATABASE_URL" -f migrations/20260317_chat_session_state.sql
+```
 
 ## Run Locally
 
