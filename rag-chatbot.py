@@ -51,11 +51,45 @@ EMBED_DIM = 1536
 SESSION_TOKEN_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 DEFAULT_SYSTEM_INSTRUCTIONS = (
-    "You are a helpful restaurant waiter. You goal is to be humourous, charismatic to persuade customers to try food here.\n"
-    "Answer using the provided Sources.\n"
-    "When you mention a menu item, include its price if present.\n"
-    "Keep answers brief.\n"
-    "Do not invent items, prices, or details, and do not ask follow up questions"
+    "You are a restaurant assistant.\n"
+    "Answer naturally, briefly, and helpfully.\n"
+    "Use ONLY the provided menu context for factual claims.\n"
+    "If the menu context does not support a fact, say you are not sure.\n"
+    "Resolve follow-up references using session context when confidence is high.\n"
+    "If reference ambiguity is high, ask one short clarifying question.\n"
+    "Mention specific item names clearly instead of vague pronouns.\n"
+    "Do not invent ingredients, prices, sides, dietary tags, or availability."
+)
+
+DEFAULT_SESSION_STATE = {
+    "session_id": "",
+    "last_response_id": None,
+    "last_discussed_item_ids": [],
+    "last_candidate_item_ids": [],
+    "last_intent": None,
+    "active_constraints": {},
+}
+
+INTENT_KEYWORDS = {
+    "compare_price": ("cheaper", "cheapest", "price", "cost", "less expensive"),
+    "ingredients": ("comes with", "include", "ingredients", "what's in", "what is in"),
+    "dietary_check": ("vegetarian", "vegan", "gluten", "dairy-free", "dairy free", "allergy", "halal"),
+    "spice_check": ("spicy", "heat", "mild", "hot"),
+    "lighter_option": ("lighter", "light", "lower calorie", "healthier"),
+}
+
+CATEGORY_KEYWORDS = (
+    "burger",
+    "pizza",
+    "sandwich",
+    "salad",
+    "appetizer",
+    "drink",
+    "dessert",
+    "pasta",
+    "curry",
+    "biryani",
+    "wrap",
 )
 
 QUERY_TYPE_LABELS = (
@@ -300,6 +334,564 @@ def build_prompt(user_q: str, context: str) -> str:
     return f"User question:\n{user_q}\n\nSources:\n{context}"
 
 
+def _copy_session_state(session_state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "session_id": str(session_state.get("session_id") or ""),
+        "last_response_id": session_state.get("last_response_id"),
+        "last_discussed_item_ids": [str(x) for x in (session_state.get("last_discussed_item_ids") or []) if str(x)],
+        "last_candidate_item_ids": [str(x) for x in (session_state.get("last_candidate_item_ids") or []) if str(x)],
+        "last_intent": session_state.get("last_intent"),
+        "active_constraints": dict(session_state.get("active_constraints") or {}),
+    }
+
+
+def _extract_response_text(resp: Any) -> str:
+    def _read(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    out = _read(resp, "output_text")
+    if isinstance(out, str) and out.strip():
+        return out.strip()
+
+    output = _read(resp, "output")
+    if isinstance(output, list):
+        parts: List[str] = []
+        for item in output:
+            content = _read(item, "content")
+            if isinstance(content, list):
+                for block in content:
+                    text = _read(block, "text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+                    elif isinstance(text, dict):
+                        value = text.get("value")
+                        if isinstance(value, str) and value.strip():
+                            parts.append(value.strip())
+        if parts:
+            return "\n".join(parts).strip()
+    return ""
+
+
+def infer_intent(user_query: str) -> Optional[str]:
+    lowered = (user_query or "").lower()
+    for intent, keywords in INTENT_KEYWORDS.items():
+        if any(k in lowered for k in keywords):
+            return intent
+    return None
+
+
+def _extract_price_cap(user_query: str) -> Optional[float]:
+    lowered = (user_query or "").lower()
+    m = re.search(r"(under|below|less than)\s*\$?\s*(\d+(?:\.\d+)?)", lowered)
+    if m:
+        return float(m.group(2))
+    return None
+
+
+def extract_active_constraints(user_query: str, previous: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(previous or {})
+    lowered = (user_query or "").lower()
+
+    price_cap = _extract_price_cap(user_query)
+    if price_cap is not None:
+        out["max_price"] = price_cap
+
+    for cat in CATEGORY_KEYWORDS:
+        if re.search(rf"\b{re.escape(cat)}s?\b", lowered):
+            out["category"] = cat
+            break
+
+    dietary = dict(out.get("dietary") or {})
+    if "vegetarian" in lowered:
+        dietary["vegetarian"] = True
+    if "vegan" in lowered:
+        dietary["vegan"] = True
+    if "gluten" in lowered:
+        dietary["gluten_free"] = True
+    if "dairy free" in lowered or "dairy-free" in lowered:
+        dietary["dairy_free"] = True
+    if dietary:
+        out["dietary"] = dietary
+
+    if "spicy" in lowered:
+        out["spicy"] = True
+
+    return out
+
+
+def _price_from_text(text: str) -> Optional[float]:
+    matches = re.findall(r"\$\s*(\d+(?:\.\d{1,2})?)", text or "")
+    if not matches:
+        return None
+    vals = [float(x) for x in matches]
+    return min(vals) if vals else None
+
+
+def _label_for_chunk(row: Dict[str, Any]) -> str:
+    for key in ("title", "page_path", "id"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return "item"
+
+
+def _load_chunk_map_by_ids(store: Optional[SupabaseStore], item_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if store is None or not item_ids:
+        return {}
+    try:
+        rows = store.get_knowledge_chunks_by_ids(item_ids)
+    except SupabaseStoreError:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        rid = str(row.get("id") or "").strip()
+        if rid:
+            out[rid] = row
+    return out
+
+
+def resolve_reference(
+    user_query: str,
+    session_state: Dict[str, Any],
+    store: Optional[SupabaseStore],
+) -> Dict[str, Any]:
+    lowered = (user_query or "").lower()
+    discussed_ids = [str(x) for x in session_state.get("last_discussed_item_ids") or [] if str(x)]
+    candidate_ids = [str(x) for x in session_state.get("last_candidate_item_ids") or [] if str(x)]
+    all_ids = list(dict.fromkeys(discussed_ids + candidate_ids))
+    chunk_map = _load_chunk_map_by_ids(store, all_ids)
+
+    def _labels(ids: List[str]) -> List[str]:
+        labels: List[str] = []
+        for cid in ids:
+            row = chunk_map.get(cid, {"id": cid})
+            labels.append(_label_for_chunk(row))
+        return labels
+
+    def _ambiguous(ids: List[str], reason: str) -> Dict[str, Any]:
+        labels = _labels(ids)[:3]
+        joined = ", ".join(labels)
+        clarifier = "Could you clarify which item you mean?"
+        if joined:
+            clarifier = f"Could you clarify which item you mean: {joined}?"
+        return {
+            "status": "ambiguous",
+            "confidence": 0.2,
+            "reason": reason,
+            "target_item_ids": ids,
+            "target_item_names": labels,
+            "clarifying_question": clarifier,
+        }
+
+    has_pronoun = bool(re.search(r"\b(it|that|that one|this one|the one)\b", lowered))
+    wants_cheaper = "cheaper" in lowered or "cheapest" in lowered
+    wants_spicier = "spicier" in lowered or "spicy one" in lowered
+    wants_lighter = "lighter" in lowered or "light one" in lowered or "healthier" in lowered
+
+    if wants_cheaper and len(candidate_ids) >= 2:
+        scored: List[Tuple[float, str]] = []
+        for cid in candidate_ids:
+            row = chunk_map.get(cid, {})
+            price = _price_from_text(str(row.get("text") or "") + "\n" + str(row.get("title") or ""))
+            if price is not None:
+                scored.append((price, cid))
+        if len(scored) == 1:
+            _, cid = scored[0]
+            return {
+                "status": "resolved",
+                "confidence": 0.8,
+                "reason": "cheaper_from_candidates",
+                "target_item_ids": [cid],
+                "target_item_names": _labels([cid]),
+            }
+        if len(scored) >= 2:
+            scored.sort(key=lambda x: x[0])
+            cid = scored[0][1]
+            return {
+                "status": "resolved",
+                "confidence": 0.95,
+                "reason": "cheaper_from_candidates",
+                "target_item_ids": [cid],
+                "target_item_names": _labels([cid]),
+            }
+        return _ambiguous(candidate_ids, "cheaper_without_prices")
+
+    if wants_spicier and candidate_ids:
+        spicy_hits: List[str] = []
+        for cid in candidate_ids:
+            text = str(chunk_map.get(cid, {}).get("text") or "").lower()
+            if "spicy" in text or "hot" in text:
+                spicy_hits.append(cid)
+        if len(spicy_hits) == 1:
+            cid = spicy_hits[0]
+            return {
+                "status": "resolved",
+                "confidence": 0.9,
+                "reason": "spicy_from_candidates",
+                "target_item_ids": [cid],
+                "target_item_names": _labels([cid]),
+            }
+        if len(spicy_hits) > 1:
+            return _ambiguous(spicy_hits, "multiple_spicy_candidates")
+
+    if wants_lighter and candidate_ids:
+        light_hits: List[str] = []
+        for cid in candidate_ids:
+            text = str(chunk_map.get(cid, {}).get("text") or "").lower()
+            if any(t in text for t in ("light", "lighter", "low calorie", "low-calorie", "lean")):
+                light_hits.append(cid)
+        if len(light_hits) == 1:
+            cid = light_hits[0]
+            return {
+                "status": "resolved",
+                "confidence": 0.85,
+                "reason": "lighter_from_candidates",
+                "target_item_ids": [cid],
+                "target_item_names": _labels([cid]),
+            }
+        if len(light_hits) > 1:
+            return _ambiguous(light_hits, "multiple_lighter_candidates")
+
+    if has_pronoun and len(discussed_ids) == 1:
+        cid = discussed_ids[0]
+        return {
+            "status": "resolved",
+            "confidence": 0.95,
+            "reason": "single_last_discussed",
+            "target_item_ids": [cid],
+            "target_item_names": _labels([cid]),
+        }
+
+    if has_pronoun and len(candidate_ids) == 1:
+        cid = candidate_ids[0]
+        return {
+            "status": "resolved",
+            "confidence": 0.85,
+            "reason": "single_candidate",
+            "target_item_ids": [cid],
+            "target_item_names": _labels([cid]),
+        }
+
+    if has_pronoun and len(candidate_ids) > 1:
+        return _ambiguous(candidate_ids, "pronoun_multi_candidates")
+
+    if has_pronoun and len(discussed_ids) > 1:
+        return _ambiguous(discussed_ids, "pronoun_multi_discussed")
+
+    return {
+        "status": "none",
+        "confidence": 0.0,
+        "reason": "no_vague_reference",
+        "target_item_ids": [],
+        "target_item_names": [],
+    }
+
+
+def build_retrieval_query(
+    raw_query: str,
+    resolved_reference: Dict[str, Any],
+    intent: Optional[str],
+    active_constraints: Dict[str, Any],
+) -> str:
+    parts: List[str] = [raw_query.strip()]
+
+    names = resolved_reference.get("target_item_names") or []
+    if resolved_reference.get("status") == "resolved" and names:
+        parts.append(f"target item: {', '.join(names)}")
+
+    if intent == "ingredients":
+        parts.append("included sides ingredients")
+    elif intent == "compare_price":
+        parts.append("price cost cheapest cheaper")
+    elif intent == "spice_check":
+        parts.append("spice spicy heat level")
+    elif intent == "lighter_option":
+        parts.append("lighter low-calorie lower calorie")
+    elif intent == "dietary_check":
+        parts.append("dietary allergens vegetarian vegan gluten-free")
+
+    category = active_constraints.get("category")
+    if category:
+        parts.append(f"category {category}")
+    max_price = active_constraints.get("max_price")
+    if max_price is not None:
+        parts.append(f"price under ${max_price}")
+    if active_constraints.get("spicy") is True:
+        parts.append("spicy options")
+    dietary = active_constraints.get("dietary") or {}
+    for k, v in dietary.items():
+        if v:
+            parts.append(str(k).replace("_", " "))
+
+    return " | ".join(p for p in parts if p)
+
+
+def retrieve_menu_items(
+    retriever: "Retriever",
+    client: OpenAI,
+    restaurant_id: str,
+    retrieval_query: str,
+    top_k: int,
+    min_score: float,
+    session_state: Dict[str, Any],
+    active_constraints: Dict[str, Any],
+) -> Dict[str, Any]:
+    prep = retriever.retrieve(
+        client=client,
+        user_q=retrieval_query,
+        top_k=max(top_k * 2, top_k),
+        min_score=min_score,
+        restaurant_id=restaurant_id,
+    )
+    base_results = prep["results"]
+
+    discussed = set(str(x) for x in session_state.get("last_discussed_item_ids") or [])
+    candidates = set(str(x) for x in session_state.get("last_candidate_item_ids") or [])
+    category = str(active_constraints.get("category") or "").lower()
+    max_price = active_constraints.get("max_price")
+
+    reranked: List[Dict[str, Any]] = []
+    for row in base_results:
+        score = float(row.get("score") or 0.0)
+        reasons: List[str] = []
+        matched_constraints: List[str] = []
+        rid = str(row.get("id") or "")
+        blob = f"{row.get('title','')} {row.get('text','')}".lower()
+
+        if rid in discussed:
+            score += 0.12
+            reasons.append("recent_discussed_boost")
+        if rid in candidates:
+            score += 0.08
+            reasons.append("candidate_boost")
+
+        if category:
+            if re.search(rf"\b{re.escape(category)}s?\b", blob):
+                score += 0.06
+                matched_constraints.append("category")
+            else:
+                score -= 0.02
+
+        if max_price is not None:
+            price = _price_from_text(blob)
+            if price is not None and price <= float(max_price):
+                score += 0.05
+                matched_constraints.append("max_price")
+            elif price is not None and price > float(max_price):
+                score -= 0.03
+
+        out = row.copy()
+        out["score"] = score
+        out["boost_reason"] = reasons
+        out["matched_constraints"] = matched_constraints
+        reranked.append(out)
+
+    reranked.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    final_results = reranked[:top_k]
+
+    return {
+        "results": final_results,
+        "timing_start": prep["timing_start"],
+        "menu_context": build_context(final_results[:MAX_SOURCES_SENT]),
+    }
+
+
+def format_menu_context(results: List[Dict[str, Any]]) -> str:
+    return build_context(results[:MAX_SOURCES_SENT])
+
+
+def build_session_context(
+    session_state: Dict[str, Any],
+    resolved_reference: Dict[str, Any],
+    intent: Optional[str],
+    active_constraints: Dict[str, Any],
+) -> str:
+    context_payload = {
+        "last_discussed_item_ids": session_state.get("last_discussed_item_ids") or [],
+        "last_candidate_item_ids": session_state.get("last_candidate_item_ids") or [],
+        "last_intent": session_state.get("last_intent"),
+        "active_constraints": active_constraints or {},
+        "resolved_reference": resolved_reference,
+        "current_intent": intent,
+    }
+    return json.dumps(context_payload, ensure_ascii=False)
+
+
+def create_assistant_response(
+    client: OpenAI,
+    system_instructions: str,
+    user_query: str,
+    menu_context: str,
+    session_context: str,
+    previous_response_id: Optional[str],
+) -> Tuple[str, Optional[str]]:
+    user_payload = (
+        "Session context:\n"
+        f"{session_context}\n\n"
+        "Retrieved menu context (facts):\n"
+        f"{menu_context or '[no menu context found]'}\n\n"
+        "Current user message:\n"
+        f"{user_query}"
+    )
+    kwargs: Dict[str, Any] = {
+        "model": CHAT_MODEL,
+        "instructions": system_instructions,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": user_payload}]}],
+    }
+    if previous_response_id:
+        kwargs["previous_response_id"] = previous_response_id
+    resp = client.responses.create(**kwargs)
+    text = _extract_response_text(resp).strip()
+    if not text:
+        text = "I’m sorry, I couldn’t generate a response right now."
+    return text, getattr(resp, "id", None)
+
+
+def infer_new_session_state(
+    session_state: Dict[str, Any],
+    resolved_reference: Dict[str, Any],
+    retrieved_results: List[Dict[str, Any]],
+    intent: Optional[str],
+    active_constraints: Dict[str, Any],
+) -> Dict[str, Any]:
+    out = _copy_session_state(session_state)
+    discussed_ids: List[str] = []
+    candidate_ids: List[str] = []
+
+    if resolved_reference.get("status") == "resolved":
+        discussed_ids = [str(x) for x in resolved_reference.get("target_item_ids") or [] if str(x)]
+
+    if not discussed_ids and retrieved_results:
+        discussed_ids = [str(retrieved_results[0].get("id") or "")]
+        discussed_ids = [x for x in discussed_ids if x]
+
+    if intent == "compare_price":
+        for row in retrieved_results[:2]:
+            rid = str(row.get("id") or "")
+            if rid:
+                candidate_ids.append(rid)
+    elif discussed_ids:
+        candidate_ids = discussed_ids[:]
+
+    out["last_discussed_item_ids"] = discussed_ids
+    out["last_candidate_item_ids"] = candidate_ids
+    out["last_intent"] = intent
+    out["active_constraints"] = dict(active_constraints or {})
+    return out
+
+
+def handle_chat_turn(
+    client: OpenAI,
+    retriever: "Retriever",
+    store: Optional[SupabaseStore],
+    restaurant_id: str,
+    user_query: str,
+    system_instructions: str,
+    session_state: Dict[str, Any],
+    top_k: int,
+    min_score: float,
+) -> Dict[str, Any]:
+    raw_query = (user_query or "").strip()
+    intent = infer_intent(raw_query) or session_state.get("last_intent")
+    active_constraints = extract_active_constraints(raw_query, session_state.get("active_constraints") or {})
+    resolved_reference = resolve_reference(raw_query, session_state, store)
+    retrieval_query = build_retrieval_query(raw_query, resolved_reference, intent, active_constraints)
+
+    if resolved_reference.get("status") == "ambiguous":
+        assistant_text = resolved_reference.get("clarifying_question") or "Could you clarify which item you mean?"
+        new_state = infer_new_session_state(
+            session_state,
+            resolved_reference,
+            [],
+            intent,
+            active_constraints,
+        )
+        return {
+            "assistant_text": assistant_text,
+            "results": [],
+            "retrieval_query": retrieval_query,
+            "resolved_reference": resolved_reference,
+            "intent": intent,
+            "active_constraints": active_constraints,
+            "response_id": None,
+            "new_session_state": new_state,
+            "fallback_reason": "ambiguity",
+        }
+
+    retrieved = retrieve_menu_items(
+        retriever=retriever,
+        client=client,
+        restaurant_id=restaurant_id,
+        retrieval_query=retrieval_query,
+        top_k=top_k,
+        min_score=min_score,
+        session_state=session_state,
+        active_constraints=active_constraints,
+    )
+    results = retrieved["results"]
+
+    if not results:
+        assistant_text = (
+            "I couldn’t find that in the menu data right now. "
+            "If you share the exact item name, I can check again."
+        )
+        new_state = infer_new_session_state(
+            session_state,
+            resolved_reference,
+            [],
+            intent,
+            active_constraints,
+        )
+        return {
+            "assistant_text": assistant_text,
+            "results": [],
+            "retrieval_query": retrieval_query,
+            "resolved_reference": resolved_reference,
+            "intent": intent,
+            "active_constraints": active_constraints,
+            "response_id": None,
+            "new_session_state": new_state,
+            "fallback_reason": "no_retrieval_results",
+        }
+
+    session_context = build_session_context(
+        session_state=session_state,
+        resolved_reference=resolved_reference,
+        intent=intent,
+        active_constraints=active_constraints,
+    )
+    menu_context = format_menu_context(results)
+    assistant_text, response_id = create_assistant_response(
+        client=client,
+        system_instructions=system_instructions,
+        user_query=raw_query,
+        menu_context=menu_context,
+        session_context=session_context,
+        previous_response_id=session_state.get("last_response_id"),
+    )
+    new_state = infer_new_session_state(
+        session_state,
+        resolved_reference,
+        results,
+        intent,
+        active_constraints,
+    )
+    new_state["last_response_id"] = response_id
+    return {
+        "assistant_text": assistant_text,
+        "results": results,
+        "retrieval_query": retrieval_query,
+        "resolved_reference": resolved_reference,
+        "intent": intent,
+        "active_constraints": active_constraints,
+        "response_id": response_id,
+        "new_session_state": new_state,
+        "fallback_reason": None,
+    }
+
+
 def normalize_query_type_label(raw: str) -> Optional[str]:
     value = (raw or "").strip().strip("\"'`")
     if not value:
@@ -379,32 +971,6 @@ def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Op
     }
 
     return normalize_query_type_label(raw), raw, meta
-
-def stream_llm_deltas(client: OpenAI, prompt: str, system_instructions: str) -> Generator[str, None, None]:
-    with client.responses.stream(
-        model=CHAT_MODEL,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system_instructions}]},
-            {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
-        ],
-    ) as stream:
-        for event in stream:
-            etype = getattr(event, "type", None)
-
-            if etype == "response.output_text.delta":
-                delta = getattr(event, "delta", None)
-                if isinstance(delta, str) and delta:
-                    yield delta
-                continue
-
-            if etype == "response.delta":
-                delta = getattr(event, "delta", None)
-                if isinstance(delta, str) and delta:
-                    yield delta
-                elif isinstance(delta, dict):
-                    seg = delta.get("text") or delta.get("content")
-                    if isinstance(seg, str) and seg:
-                        yield seg
 
 
 class Retriever:
@@ -622,6 +1188,44 @@ class ChatHandler(BaseHTTPRequestHandler):
         if custom_prompt:
             return custom_prompt
         return DEFAULT_SYSTEM_INSTRUCTIONS
+
+    def _load_session_state(self, session_id: str, request_id: str) -> Dict[str, Any]:
+        if self.store is None:
+            state = dict(DEFAULT_SESSION_STATE)
+            state["session_id"] = session_id
+            return state
+        try:
+            state = self.store.get_session_state(session_id)
+            if not isinstance(state, dict):
+                raise SupabaseStoreError("get_session_state returned non-dict payload")
+            state = _copy_session_state(state)
+            state["session_id"] = session_id
+            return state
+        except SupabaseStoreError as exc:
+            log_event(
+                "session_state_load_failed",
+                request_id=request_id,
+                session_id=session_id,
+                error=str(exc),
+            )
+            state = dict(DEFAULT_SESSION_STATE)
+            state["session_id"] = session_id
+            return state
+
+    def _persist_session_state(self, session_id: str, new_state: Dict[str, Any], request_id: str) -> None:
+        if self.store is None:
+            return
+        payload = _copy_session_state(new_state)
+        payload["session_id"] = session_id
+        try:
+            self.store.upsert_session_state(session_id, payload)
+        except SupabaseStoreError as exc:
+            log_event(
+                "session_state_persist_failed",
+                request_id=request_id,
+                session_id=session_id,
+                error=str(exc),
+            )
 
     def _schedule_query_type_classification(
         self,
@@ -948,24 +1552,20 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         session_id = None
         user_message_id = None
-        if self.persist_chat:
-            if self.store is None:
-                self._send_json_error(
-                    500,
-                    "Chat persistence is enabled but Supabase is not configured",
-                    request_id=request_id,
-                )
-                return
-            try:
-                session_id = self.store.upsert_session(restaurant_id, session_token, self._extract_client_meta())
+        if self.store is None:
+            self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
+            return
+        try:
+            session_id = self.store.upsert_session(restaurant_id, session_token, self._extract_client_meta())
+            if self.persist_chat:
                 user_row = self.store.insert_message(session_id, "user", user_msg, return_row=True)
                 if user_row is not None:
                     row_id = user_row.get("id")
                     if row_id:
                         user_message_id = str(row_id)
-            except SupabaseStoreError as exc:
-                self._send_json_error(502, f"Failed to persist chat session: {exc}", request_id=request_id)
-                return
+        except SupabaseStoreError as exc:
+            self._send_json_error(502, f"Failed to persist chat session: {exc}", request_id=request_id)
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -976,7 +1576,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         assistant_text = ""
-        prep = None
+        results: List[Dict[str, Any]] = []
+        turn: Optional[Dict[str, Any]] = None
         try:
             session_line = json.dumps(
                 {
@@ -988,21 +1589,46 @@ class ChatHandler(BaseHTTPRequestHandler):
             ) + "\n"
             self._write_chunk(session_line)
 
-            prep = self.retriever.retrieve(
-                self.client,
-                user_msg,
-                self.top_k,
-                self.min_score,
+            session_state = self._load_session_state(session_id, request_id)
+            log_event(
+                "chat_turn_start",
+                request_id=request_id,
                 restaurant_id=restaurant_id,
+                session_id=session_id,
+                raw_user_query=user_msg,
+                previous_response_id=session_state.get("last_response_id"),
             )
-            prompt = prep["prompt"]
-            results = prep["results"]
-            first_token_sent = False
 
-            for delta in stream_llm_deltas(self.client, prompt, system_instructions):
-                first_token_sent = True
-                assistant_text += delta
-                line = json.dumps({"type": "delta", "content": delta}, ensure_ascii=False) + "\n"
+            turn = handle_chat_turn(
+                client=self.client,
+                retriever=self.retriever,
+                store=self.store,
+                restaurant_id=restaurant_id,
+                user_query=user_msg,
+                system_instructions=system_instructions,
+                session_state=session_state,
+                top_k=self.top_k,
+                min_score=self.min_score,
+            )
+            assistant_text = (turn.get("assistant_text") or "").strip()
+            results = list(turn.get("results") or [])
+
+            log_event(
+                "chat_turn_resolution",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                session_id=session_id,
+                resolved_reference=turn.get("resolved_reference"),
+                rewritten_retrieval_query=turn.get("retrieval_query"),
+                retrieved_item_ids=[str(r.get("id") or "") for r in results],
+                intent=turn.get("intent"),
+                active_constraints=turn.get("active_constraints"),
+                response_id=turn.get("response_id"),
+                fallback_reason=turn.get("fallback_reason"),
+            )
+
+            if assistant_text:
+                line = json.dumps({"type": "delta", "content": assistant_text}, ensure_ascii=False) + "\n"
                 self._write_chunk(line)
 
             done_line = json.dumps({"type": "done"}) + "\n"
@@ -1016,23 +1642,24 @@ class ChatHandler(BaseHTTPRequestHandler):
                 request_id=request_id,
             )
 
+            if turn is not None:
+                self._persist_session_state(
+                    session_id=session_id,
+                    new_state=turn.get("new_session_state") or {},
+                    request_id=request_id,
+                )
+
             if self.persist_chat and session_id is not None:
-                latency_ms = int((time.perf_counter() - prep["timing_start"]) * 1000)
+                latency_ms = int((time.perf_counter() - start) * 1000)
                 self.store.insert_message(
                     session_id,
                     "assistant",
-                    assistant_text.strip(),
+                    assistant_text,
                     sources=self._source_refs(results),
                     latency_ms=latency_ms,
                     delivery_status="complete",
                 )
 
-            if DEBUG_TIMINGS:
-                elapsed_ms = (time.perf_counter() - prep["timing_start"]) * 1000
-                print(
-                    f"[debug] web request complete | backend=supabase "
-                    f"first_token={first_token_sent} total={elapsed_ms:.1f}ms"
-                )
             log_event(
                 "chat_request",
                 request_id=request_id,
@@ -1060,9 +1687,7 @@ class ChatHandler(BaseHTTPRequestHandler):
 
             if self.persist_chat and session_id is not None:
                 try:
-                    latency_ms = None
-                    if prep is not None:
-                        latency_ms = int((time.perf_counter() - prep["timing_start"]) * 1000)
+                    latency_ms = int((time.perf_counter() - start) * 1000)
                     self.store.insert_message(
                         session_id,
                         "assistant",
