@@ -227,4 +227,3 @@ curl -N -X POST https://mbd-api.onrender.com/api/chat-stream \
     \"restaurantId\":\"$RID\",
     \"widgetToken\":\"$WIDGET_TOKEN\"
   }"
-
