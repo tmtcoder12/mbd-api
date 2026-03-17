@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -286,6 +287,86 @@ class SupabaseStore:
             query={"id": f"eq.{mid}"},
             prefer="return=minimal",
         )
+
+    def get_session_state(self, session_id: str) -> Dict[str, Any]:
+        sid = self._require_uuid(session_id, "session_id")
+        data = self._request(
+            "GET",
+            "/rest/v1/chat_session_state",
+            query={
+                "select": "session_id,last_response_id,last_discussed_item_ids,last_candidate_item_ids,last_intent,active_constraints,updated_at",
+                "session_id": f"eq.{sid}",
+                "limit": "1",
+            },
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            return {
+                "session_id": str(row.get("session_id") or sid),
+                "last_response_id": row.get("last_response_id"),
+                "last_discussed_item_ids": row.get("last_discussed_item_ids") or [],
+                "last_candidate_item_ids": row.get("last_candidate_item_ids") or [],
+                "last_intent": row.get("last_intent"),
+                "active_constraints": row.get("active_constraints") or {},
+            }
+        return {
+            "session_id": sid,
+            "last_response_id": None,
+            "last_discussed_item_ids": [],
+            "last_candidate_item_ids": [],
+            "last_intent": None,
+            "active_constraints": {},
+        }
+
+    def upsert_session_state(self, session_id: str, state_fields: Dict[str, Any]) -> Dict[str, Any]:
+        sid = self._require_uuid(session_id, "session_id")
+        payload = {
+            "session_id": sid,
+            "last_response_id": state_fields.get("last_response_id"),
+            "last_discussed_item_ids": state_fields.get("last_discussed_item_ids") or [],
+            "last_candidate_item_ids": state_fields.get("last_candidate_item_ids") or [],
+            "last_intent": state_fields.get("last_intent"),
+            "active_constraints": state_fields.get("active_constraints") or {},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        data = self._request(
+            "POST",
+            "/rest/v1/chat_session_state",
+            payload=[payload],
+            query={"on_conflict": "session_id"},
+            prefer="resolution=merge-duplicates,return=representation",
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        if isinstance(data, dict):
+            return data
+        raise SupabaseStoreError("upsert_session_state did not return row data")
+
+    def get_knowledge_chunks_by_ids(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        if not chunk_ids:
+            return []
+        normalized: List[str] = []
+        for cid in chunk_ids:
+            raw = str(cid or "").strip()
+            if raw:
+                normalized.append(raw)
+        if not normalized:
+            return []
+        in_expr = "(" + ",".join(f'"{cid}"' for cid in normalized) + ")"
+        data = self._request(
+            "GET",
+            "/rest/v1/knowledge_chunks",
+            query={
+                "select": "id,title,text,type,source_url,page_path",
+                "id": f"in.{in_expr}",
+                "limit": str(len(normalized)),
+            },
+        )
+        if isinstance(data, list):
+            return data
+        raise SupabaseStoreError("get_knowledge_chunks_by_ids returned non-list payload")
 
     def match_chunks(
         self,
