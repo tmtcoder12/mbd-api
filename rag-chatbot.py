@@ -92,6 +92,26 @@ CATEGORY_KEYWORDS = (
     "wrap",
 )
 
+IMAGE_INTENT_KEYWORDS_RECOMMEND = (
+    "recommend",
+    "suggest",
+    "best",
+    "popular",
+    "top pick",
+    "what should i get",
+)
+
+IMAGE_INTENT_KEYWORDS_PHOTO = (
+    "photo",
+    "picture",
+    "image",
+    "look like",
+    "show me",
+    "see",
+)
+
+MAX_IMAGE_URLS_SENT = 3
+
 QUERY_TYPE_LABELS = (
     "Operations",
     "Dietary",
@@ -418,6 +438,41 @@ def extract_active_constraints(user_query: str, previous: Dict[str, Any]) -> Dic
     if "spicy" in lowered:
         out["spicy"] = True
 
+    return out
+
+
+def should_include_images(user_query: str, intent: Optional[str]) -> Tuple[bool, str]:
+    lowered = (user_query or "").lower()
+    if any(k in lowered for k in IMAGE_INTENT_KEYWORDS_PHOTO):
+        return True, "photo_keyword_match"
+    if any(k in lowered for k in IMAGE_INTENT_KEYWORDS_RECOMMEND):
+        return True, "recommendation_keyword_match"
+    if intent in {"compare_price", "lighter_option"} and "show" in lowered:
+        return True, "intent_plus_show"
+    return False, "no_image_intent"
+
+
+def build_image_payload(results: List[Dict[str, Any]], max_images: int = MAX_IMAGE_URLS_SENT) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen_urls = set()
+    limit = max(1, int(max_images))
+    for row in results:
+        image_url = str(row.get("image_url") or "").strip()
+        if not image_url:
+            continue
+        if image_url in seen_urls:
+            continue
+        seen_urls.add(image_url)
+        out.append(
+            {
+                "chunk_id": str(row.get("id") or ""),
+                "title": str(row.get("title") or ""),
+                "image_url": image_url,
+                "score": float(row.get("score") or 0.0),
+            }
+        )
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -1010,9 +1065,34 @@ class Retriever:
                     "source_url": row.get("source_url", ""),
                     "page_path": row.get("page_path", ""),
                     "title": row.get("title", ""),
+                    "image_url": row.get("image_url", ""),
                     "score": float(row.get("score") or 0.0),
                 }
             )
+
+        missing_image_ids = [
+            str(r.get("id") or "")
+            for r in results
+            if str(r.get("id") or "") and not str(r.get("image_url") or "").strip()
+        ]
+        if missing_image_ids:
+            try:
+                hydrated = self.supabase_store.get_knowledge_chunks_by_ids(missing_image_ids)
+                hydrated_map = {
+                    str(r.get("id") or ""): r
+                    for r in hydrated
+                    if str(r.get("id") or "")
+                }
+                for row in results:
+                    rid = str(row.get("id") or "")
+                    if not rid or str(row.get("image_url") or "").strip():
+                        continue
+                    extra = hydrated_map.get(rid, {})
+                    img = str(extra.get("image_url") or "").strip()
+                    if img:
+                        row["image_url"] = img
+            except SupabaseStoreError:
+                pass
 
         t2 = time.perf_counter()
         results_for_llm = results[:MAX_SOURCES_SENT]
@@ -1146,6 +1226,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "score": float(row.get("score") or 0.0),
                     "source_url": row.get("source_url", ""),
                     "title": row.get("title", ""),
+                    "image_url": row.get("image_url", ""),
                 }
             )
         return refs
@@ -1630,6 +1711,39 @@ class ChatHandler(BaseHTTPRequestHandler):
             if assistant_text:
                 line = json.dumps({"type": "delta", "content": assistant_text}, ensure_ascii=False) + "\n"
                 self._write_chunk(line)
+
+            turn_intent = turn.get("intent") if isinstance(turn, dict) else None
+            include_images, image_gate_reason = should_include_images(user_msg, turn_intent)
+            log_event(
+                "image_intent_gate",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                session_id=session_id,
+                include_images=include_images,
+                reason=image_gate_reason,
+                intent=turn_intent,
+            )
+            images_payload: List[Dict[str, Any]] = []
+            if include_images:
+                images_payload = build_image_payload(results, max_images=MAX_IMAGE_URLS_SENT)
+                if images_payload:
+                    images_line = json.dumps(
+                        {
+                            "type": "images",
+                            "images": images_payload,
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+                    self._write_chunk(images_line)
+
+            log_event(
+                "images_emitted",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                session_id=session_id,
+                images_emitted_count=len(images_payload),
+                image_chunk_ids=[x.get("chunk_id") for x in images_payload],
+            )
 
             done_line = json.dumps({"type": "done"}) + "\n"
             self._write_chunk(done_line)

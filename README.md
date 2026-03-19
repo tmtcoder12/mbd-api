@@ -98,6 +98,7 @@ Streaming event types:
 
 - `{"type":"session","sessionToken":"...","restaurantId":"...","generated":true|false}`
 - `{"type":"delta","content":"..."}`
+- `{"type":"images","images":[{"chunk_id":"...","title":"...","image_url":"...","score":0.0}]}` (optional, recommendation/photo intent only)
 - `{"type":"done"}`
 - `{"type":"error","message":"..."}`
 
