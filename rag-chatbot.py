@@ -125,6 +125,10 @@ QUERY_CLASSIFIER_INSTRUCTIONS = (
     "Return exactly one label and no other text."
 )
 
+QUERY_CACHE_NAMESPACE_DEFAULT = "qcache:v1"
+QUERY_CACHE_TTL_SECONDS_DEFAULT = 900
+QUERY_CACHE_SCHEMA_VERSION = 1
+
 
 class SlidingWindowRateLimiter:
     def __init__(self, max_requests: int, window_seconds: int):
@@ -169,6 +173,31 @@ class RedisSlidingWindowRateLimiter:
         pipe.expire(key, max(1, window_seconds))
         pipe.execute()
         return True
+
+
+class RedisQueryCache:
+    def __init__(self, redis_url: str):
+        if redis is None:
+            raise RuntimeError("redis package is required when query cache is enabled")
+        self.client = redis.Redis.from_url(redis_url)
+
+    def get_json(self, key: str) -> Optional[Dict[str, Any]]:
+        raw = self.client.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+        return None
+
+    def set_json(self, key: str, payload: Dict[str, Any], ttl_seconds: int) -> None:
+        ttl = max(1, int(ttl_seconds))
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        self.client.set(key, body, ex=ttl)
 
 
 def _b64url_decode(text: str) -> bytes:
@@ -458,6 +487,120 @@ def _normalize_image_decision(raw: Any) -> Dict[str, Any]:
     decision["max_images"] = max_images
     decision["target_item_names"] = names[:5]
     return decision
+
+
+def _normalize_query_for_cache(user_query: str) -> str:
+    return " ".join((user_query or "").strip().lower().split())
+
+
+def _is_followup_reference_query(user_query: str) -> bool:
+    lowered = _normalize_query_for_cache(user_query)
+    if not lowered:
+        return False
+    pattern = (
+        r"\b("
+        r"it|that|that one|this one|the one|"
+        r"what about (it|that)|"
+        r"cheaper one|spicier one|lighter one|same one"
+        r")\b"
+    )
+    return bool(re.search(pattern, lowered))
+
+
+def query_cache_eligibility(
+    user_query: str,
+    session_state: Dict[str, Any],
+    resolved_reference: Dict[str, Any],
+) -> Tuple[bool, str]:
+    if not (user_query or "").strip():
+        return False, "empty_query"
+    if session_state.get("last_response_id"):
+        return False, "has_previous_response_id"
+    status = str(resolved_reference.get("status") or "")
+    if status in {"resolved", "ambiguous"}:
+        return False, f"reference_status_{status}"
+    if _is_followup_reference_query(user_query):
+        return False, "followup_reference_pattern"
+    return True, "eligible"
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def build_query_cache_key(
+    namespace: str,
+    restaurant_id: str,
+    user_query: str,
+    system_instructions: str,
+    top_k: int,
+    min_score: float,
+    model: str = CHAT_MODEL,
+) -> str:
+    ns = (namespace or QUERY_CACHE_NAMESPACE_DEFAULT).strip() or QUERY_CACHE_NAMESPACE_DEFAULT
+    fingerprint = {
+        "q": _normalize_query_for_cache(user_query),
+        "restaurant_id": str(restaurant_id or ""),
+        "model": str(model or ""),
+        "top_k": int(top_k),
+        "min_score": float(min_score),
+        "system_instructions_sha256": _hash_text(system_instructions or ""),
+    }
+    digest = _hash_text(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False))
+    return f"{ns}:{restaurant_id}:{digest}"
+
+
+def _cacheable_turn_payload(turn: Dict[str, Any], ttl_seconds: int) -> Dict[str, Any]:
+    state = _copy_session_state(turn.get("new_session_state") or {})
+    state["last_response_id"] = None
+    payload = {
+        "assistant_text": str(turn.get("assistant_text") or ""),
+        "results": list(turn.get("results") or []),
+        "image_decision": _normalize_image_decision(turn.get("image_decision")),
+        "intent": turn.get("intent"),
+        "active_constraints": dict(turn.get("active_constraints") or {}),
+        "retrieval_query": str(turn.get("retrieval_query") or ""),
+        "resolved_reference": dict(turn.get("resolved_reference") or {}),
+        "new_session_state": state,
+        "fallback_reason": turn.get("fallback_reason"),
+        "created_at": int(time.time()),
+        "ttl_seconds": max(1, int(ttl_seconds)),
+        "schema_version": QUERY_CACHE_SCHEMA_VERSION,
+    }
+    return payload
+
+
+def _turn_from_cached_payload(
+    cached_payload: Dict[str, Any],
+    session_state: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(cached_payload, dict):
+        return None
+
+    results = cached_payload.get("results")
+    if not isinstance(results, list):
+        return None
+
+    assistant_text = str(cached_payload.get("assistant_text") or "").strip()
+    if not assistant_text:
+        return None
+
+    new_state = _copy_session_state(cached_payload.get("new_session_state") or session_state or {})
+    new_state["last_response_id"] = session_state.get("last_response_id")
+
+    return {
+        "assistant_text": assistant_text,
+        "results": results,
+        "retrieval_query": str(cached_payload.get("retrieval_query") or ""),
+        "resolved_reference": dict(cached_payload.get("resolved_reference") or {}),
+        "intent": cached_payload.get("intent"),
+        "active_constraints": dict(cached_payload.get("active_constraints") or {}),
+        "response_id": None,
+        "image_decision": _normalize_image_decision(cached_payload.get("image_decision")),
+        "new_session_state": new_state,
+        "fallback_reason": cached_payload.get("fallback_reason"),
+        "cache_hit": True,
+    }
 
 
 def _title_from_page_path(page_path: str) -> str:
@@ -1049,12 +1192,92 @@ def handle_chat_turn(
     session_state: Dict[str, Any],
     top_k: int,
     min_score: float,
+    query_cache: Optional[RedisQueryCache] = None,
+    query_cache_namespace: str = QUERY_CACHE_NAMESPACE_DEFAULT,
+    query_cache_ttl_seconds: int = QUERY_CACHE_TTL_SECONDS_DEFAULT,
+    request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     raw_query = (user_query or "").strip()
     intent = infer_intent(raw_query) or session_state.get("last_intent")
     active_constraints = extract_active_constraints(raw_query, session_state.get("active_constraints") or {})
     resolved_reference = resolve_reference(raw_query, session_state, store)
+
+    cache_eligible, cache_reason = query_cache_eligibility(raw_query, session_state, resolved_reference)
+    cache_key_prefix = (
+        f"{(query_cache_namespace or QUERY_CACHE_NAMESPACE_DEFAULT).strip() or QUERY_CACHE_NAMESPACE_DEFAULT}:{restaurant_id}"
+    )
+    cache_key = ""
+    if query_cache is not None:
+        log_event(
+            "query_cache_lookup",
+            request_id=request_id,
+            restaurant_id=restaurant_id,
+            eligible=cache_eligible,
+            reason=cache_reason,
+            key_prefix=cache_key_prefix,
+        )
+    if query_cache is not None and cache_eligible:
+        cache_key = build_query_cache_key(
+            namespace=query_cache_namespace,
+            restaurant_id=restaurant_id,
+            user_query=raw_query,
+            system_instructions=system_instructions,
+            top_k=top_k,
+            min_score=min_score,
+            model=CHAT_MODEL,
+        )
+        try:
+            cached_payload = query_cache.get_json(cache_key)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                "query_cache_error",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                action="get",
+                error=str(exc),
+                key_prefix=cache_key_prefix,
+            )
+            cached_payload = None
+        cached_turn = _turn_from_cached_payload(cached_payload, session_state)
+        if cached_turn is not None:
+            log_event(
+                "query_cache_hit",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+            )
+            return cached_turn
+        log_event(
+            "query_cache_miss",
+            request_id=request_id,
+            restaurant_id=restaurant_id,
+            key_prefix=cache_key_prefix,
+        )
+
     retrieval_query = build_retrieval_query(raw_query, resolved_reference, intent, active_constraints)
+
+    def _maybe_store_cache(turn_payload: Dict[str, Any]) -> None:
+        if query_cache is None or not cache_eligible or not cache_key:
+            return
+        payload = _cacheable_turn_payload(turn_payload, query_cache_ttl_seconds)
+        try:
+            query_cache.set_json(cache_key, payload, query_cache_ttl_seconds)
+            log_event(
+                "query_cache_store",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+                ttl_seconds=max(1, int(query_cache_ttl_seconds)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                "query_cache_error",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                action="set",
+                error=str(exc),
+                key_prefix=cache_key_prefix,
+            )
 
     if resolved_reference.get("status") == "ambiguous":
         assistant_text = resolved_reference.get("clarifying_question") or "Could you clarify which item you mean?"
@@ -1076,6 +1299,7 @@ def handle_chat_turn(
             "image_decision": dict(DEFAULT_IMAGE_DECISION),
             "new_session_state": new_state,
             "fallback_reason": "ambiguity",
+            "cache_hit": False,
         }
 
     retrieved = retrieve_menu_items(
@@ -1102,7 +1326,7 @@ def handle_chat_turn(
             intent,
             active_constraints,
         )
-        return {
+        turn_payload = {
             "assistant_text": assistant_text,
             "results": [],
             "retrieval_query": retrieval_query,
@@ -1113,7 +1337,10 @@ def handle_chat_turn(
             "image_decision": dict(DEFAULT_IMAGE_DECISION),
             "new_session_state": new_state,
             "fallback_reason": "no_retrieval_results",
+            "cache_hit": False,
         }
+        _maybe_store_cache(turn_payload)
+        return turn_payload
 
     session_context = build_session_context(
         session_state=session_state,
@@ -1138,7 +1365,7 @@ def handle_chat_turn(
         active_constraints,
     )
     new_state["last_response_id"] = response_id
-    return {
+    turn_payload = {
         "assistant_text": assistant_text,
         "results": results,
         "retrieval_query": retrieval_query,
@@ -1149,7 +1376,10 @@ def handle_chat_turn(
         "image_decision": image_decision,
         "new_session_state": new_state,
         "fallback_reason": None,
+        "cache_hit": False,
     }
+    _maybe_store_cache(turn_payload)
+    return turn_payload
 
 
 def normalize_query_type_label(raw: str) -> Optional[str]:
@@ -1339,6 +1569,9 @@ class ChatHandler(BaseHTTPRequestHandler):
     allow_localhost_origins: bool = True
     rate_limiter: Optional[SlidingWindowRateLimiter] = None
     redis_rate_limiter: Optional[RedisSlidingWindowRateLimiter] = None
+    query_cache: Optional[RedisQueryCache] = None
+    query_cache_ttl_seconds: int = QUERY_CACHE_TTL_SECONDS_DEFAULT
+    query_cache_namespace: str = QUERY_CACHE_NAMESPACE_DEFAULT
     widget_signing_keys: Dict[str, bytes] = {}
     widget_active_kid: str = "v1"
     default_ip_max_requests: int = 30
@@ -1902,6 +2135,10 @@ class ChatHandler(BaseHTTPRequestHandler):
                 session_state=session_state,
                 top_k=self.top_k,
                 min_score=self.min_score,
+                query_cache=self.query_cache,
+                query_cache_namespace=self.query_cache_namespace,
+                query_cache_ttl_seconds=self.query_cache_ttl_seconds,
+                request_id=request_id,
             )
             assistant_text = (turn.get("assistant_text") or "").strip()
             results = list(turn.get("results") or [])
@@ -1919,6 +2156,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 image_decision=turn.get("image_decision"),
                 response_id=turn.get("response_id"),
                 fallback_reason=turn.get("fallback_reason"),
+                cache_hit=bool(turn.get("cache_hit")),
             )
 
             if assistant_text:
@@ -2060,6 +2298,13 @@ def serve(top_k: int = 8, port: int = 8000):
     token_max_age_s = int(os.getenv("WIDGET_TOKEN_MAX_AGE_SECONDS", "900"))
     allow_localhost_origins = parse_bool_env("ALLOW_LOCALHOST_ORIGINS", True)
     redis_rate_limit_url = (os.getenv("RATE_LIMIT_REDIS_URL") or "").strip()
+    query_cache_redis_url = (os.getenv("QUERY_CACHE_REDIS_URL") or redis_rate_limit_url).strip()
+    query_cache_enabled = parse_bool_env("QUERY_CACHE_ENABLED", bool(query_cache_redis_url))
+    query_cache_ttl_seconds = int(os.getenv("QUERY_CACHE_TTL_SECONDS", str(QUERY_CACHE_TTL_SECONDS_DEFAULT)))
+    query_cache_ttl_seconds = max(1, query_cache_ttl_seconds)
+    query_cache_namespace = (os.getenv("QUERY_CACHE_NAMESPACE") or QUERY_CACHE_NAMESPACE_DEFAULT).strip()
+    if not query_cache_namespace:
+        query_cache_namespace = QUERY_CACHE_NAMESPACE_DEFAULT
     signing_keys_raw = os.getenv("WIDGET_SIGNING_KEYS", "").strip()
     widget_active_kid = (os.getenv("WIDGET_ACTIVE_KID") or "v1").strip()
     query_classifier_model = (os.getenv("QUERY_CLASSIFIER_MODEL") or QUERY_CLASSIFIER_MODEL_DEFAULT).strip()
@@ -2095,6 +2340,16 @@ def serve(top_k: int = 8, port: int = 8000):
         ChatHandler.rate_limiter = None
     else:
         ChatHandler.redis_rate_limiter = None
+    if query_cache_enabled and query_cache_redis_url:
+        try:
+            ChatHandler.query_cache = RedisQueryCache(query_cache_redis_url)
+        except Exception as exc:  # noqa: BLE001
+            ChatHandler.query_cache = None
+            print(f"⚠️ Query cache disabled due to init error: {exc}")
+    else:
+        ChatHandler.query_cache = None
+    ChatHandler.query_cache_ttl_seconds = query_cache_ttl_seconds
+    ChatHandler.query_cache_namespace = query_cache_namespace
     ChatHandler.widget_signing_keys = widget_signing_keys
     ChatHandler.widget_active_kid = widget_active_kid
     ChatHandler.default_ip_max_requests = rate_limit_rpm
@@ -2125,6 +2380,12 @@ def serve(top_k: int = 8, port: int = 8000):
     )
     print(f"   - Allow localhost origins: {'yes' if allow_localhost_origins else 'no'}")
     print(f"   - Redis limiter: {'enabled' if redis_rate_limit_url else 'disabled (in-memory fallback)'}")
+    if query_cache_enabled and query_cache_redis_url:
+        print(
+            f"   - Query cache: enabled (redis, ttl={query_cache_ttl_seconds}s, namespace={query_cache_namespace})"
+        )
+    else:
+        print("   - Query cache: disabled")
     print(f"   - Signing keys loaded: {len(widget_signing_keys)}")
     print(f"   - Active widget key id: {widget_active_kid}")
     print(f"   - Query classifier model: {query_classifier_model}")

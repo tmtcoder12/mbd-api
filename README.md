@@ -141,6 +141,13 @@ Streaming event types:
 - `RATE_LIMIT_REDIS_URL`  
   If set, Redis sliding-window limiter is used; otherwise in-memory limiter is used.
 
+### Optional query cache (Redis)
+
+- `QUERY_CACHE_ENABLED` (default: `true` when a Redis URL is available)
+- `QUERY_CACHE_REDIS_URL` (defaults to `RATE_LIMIT_REDIS_URL` when omitted)
+- `QUERY_CACHE_TTL_SECONDS` (default: `900`)
+- `QUERY_CACHE_NAMESPACE` (default: `qcache:v1`)
+
 ## Retrieval Backend
 
 Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.  
