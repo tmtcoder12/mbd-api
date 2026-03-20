@@ -118,6 +118,17 @@ DEFAULT_IMAGE_DECISION = {
     "target_item_names": [],
 }
 
+GENERIC_IMAGE_TITLES = {
+    "",
+    "menu",
+    "menu item",
+    "menu items",
+    "food menu",
+    "items",
+    "dish",
+    "dishes",
+}
+
 QUERY_TYPE_LABELS = (
     "Operations",
     "Dietary",
@@ -471,6 +482,101 @@ def _normalize_image_decision(raw: Any) -> Dict[str, Any]:
     return decision
 
 
+def _title_from_page_path(page_path: str) -> str:
+    path = str(page_path or "").strip()
+    if not path:
+        return ""
+    segment = path.rstrip("/").split("/")[-1].strip()
+    if not segment:
+        return ""
+    segment = re.sub(r"[-_]+", " ", segment)
+    segment = re.sub(r"\s+", " ", segment).strip()
+    if not segment or len(segment) > 80:
+        return ""
+    return segment.title()
+
+
+def _extract_name_from_text(text: str) -> str:
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    ignored_labels = {"price", "description", "ingredients", "includes", "comes with", "notes", "hours"}
+    for raw in lines[:5]:
+        line = re.sub(r"^[\-\*\d\.\)\s]+", "", raw).strip()
+        if not line:
+            continue
+
+        left = ""
+        if " - " in line:
+            left = line.split(" - ", 1)[0].strip()
+        elif ":" in line:
+            left = line.split(":", 1)[0].strip()
+        if left:
+            lowered = left.lower()
+            if lowered not in ignored_labels and 1 <= len(left.split()) <= 8 and len(left) <= 80:
+                return left
+
+        match = re.search(
+            r"([A-Z][A-Za-z0-9&'/-]*(?:\s+[A-Z][A-Za-z0-9&'/-]*){0,5})(?:\s+\$|\s+-|$)",
+            line,
+        )
+        if match:
+            candidate = match.group(1).strip()
+            if candidate and len(candidate) <= 80:
+                return candidate
+    return ""
+
+
+def _is_generic_image_title(title: str) -> bool:
+    cleaned = str(title or "").strip().lower()
+    if not cleaned:
+        return True
+    if cleaned in GENERIC_IMAGE_TITLES:
+        return True
+    return cleaned.startswith("menu ")
+
+
+def _item_name_from_extra_metadata(row: Dict[str, Any]) -> str:
+    meta = row.get("extra_metadata")
+    if not isinstance(meta, dict):
+        return ""
+    for key, value in meta.items():
+        if str(key or "").strip().lower() == "item_name":
+            item_name = str(value or "").strip()
+            if item_name:
+                return item_name
+    return ""
+
+
+def _derive_image_title(row: Dict[str, Any], target_item_names: List[str]) -> str:
+    from_meta = _item_name_from_extra_metadata(row)
+    if from_meta:
+        return from_meta
+
+    title = str(row.get("title") or "").strip()
+    blob = f"{row.get('title','')} {row.get('text','')}".lower()
+    for name in target_item_names:
+        n = str(name or "").strip()
+        if n and n.lower() in blob:
+            return n
+
+    if not _is_generic_image_title(title):
+        return title
+
+    from_text = _extract_name_from_text(str(row.get("text") or ""))
+    if from_text:
+        return from_text
+
+    from_path = _title_from_page_path(str(row.get("page_path") or ""))
+    if from_path:
+        return from_path
+
+    return title or "Menu Item"
+
+
 def build_image_payload_from_decision(
     results: List[Dict[str, Any]],
     image_decision: Dict[str, Any],
@@ -506,7 +612,7 @@ def build_image_payload_from_decision(
         out.append(
             {
                 "chunk_id": str(row.get("id") or ""),
-                "title": str(row.get("title") or ""),
+                "title": _derive_image_title(row, decision.get("target_item_names") or []),
                 "image_url": image_url,
                 "score": float(row.get("score") or 0.0),
             }
@@ -1169,18 +1275,15 @@ class Retriever:
                     "page_path": row.get("page_path", ""),
                     "title": row.get("title", ""),
                     "image_url": row.get("image_url", ""),
+                    "extra_metadata": row.get("extra_metadata", {}),
                     "score": float(row.get("score") or 0.0),
                 }
             )
 
-        missing_image_ids = [
-            str(r.get("id") or "")
-            for r in results
-            if str(r.get("id") or "") and not str(r.get("image_url") or "").strip()
-        ]
-        if missing_image_ids:
+        hydrate_ids = [str(r.get("id") or "") for r in results if str(r.get("id") or "")]
+        if hydrate_ids:
             try:
-                hydrated = self.supabase_store.get_knowledge_chunks_by_ids(missing_image_ids)
+                hydrated = self.supabase_store.get_knowledge_chunks_by_ids(hydrate_ids)
                 hydrated_map = {
                     str(r.get("id") or ""): r
                     for r in hydrated
@@ -1188,12 +1291,15 @@ class Retriever:
                 }
                 for row in results:
                     rid = str(row.get("id") or "")
-                    if not rid or str(row.get("image_url") or "").strip():
+                    if not rid:
                         continue
                     extra = hydrated_map.get(rid, {})
                     img = str(extra.get("image_url") or "").strip()
-                    if img:
+                    if img and not str(row.get("image_url") or "").strip():
                         row["image_url"] = img
+                    meta = extra.get("extra_metadata")
+                    if isinstance(meta, dict) and meta:
+                        row["extra_metadata"] = meta
             except SupabaseStoreError:
                 pass
 

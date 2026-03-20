@@ -359,7 +359,7 @@ class SupabaseStore:
             "GET",
             "/rest/v1/knowledge_chunks",
             query={
-                "select": "id,title,text,type,source_url,page_path,image_url",
+                "select": "id,title,text,type,source_url,page_path,image_url,extra_metadata",
                 "id": f"in.{in_expr}",
                 "limit": str(len(normalized)),
             },
