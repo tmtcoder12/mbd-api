@@ -1,4 +1,7 @@
-parallel_query_runner.py 
+parallel_query_runner.py
 questions.txt
 .env
 myenv/
+__pycache__/
+*.pyc
+.pytest_cache/

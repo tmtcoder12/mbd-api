@@ -92,24 +92,6 @@ CATEGORY_KEYWORDS = (
     "wrap",
 )
 
-IMAGE_INTENT_KEYWORDS_RECOMMEND = (
-    "recommend",
-    "suggest",
-    "best",
-    "popular",
-    "top pick",
-    "what should i get",
-)
-
-IMAGE_INTENT_KEYWORDS_PHOTO = (
-    "photo",
-    "picture",
-    "image",
-    "look like",
-    "show me",
-    "see",
-)
-
 MAX_IMAGE_URLS_SENT = 3
 
 DEFAULT_IMAGE_DECISION = {
@@ -365,10 +347,6 @@ def build_context(results: List[Dict[str, Any]]) -> str:
         text = (r.get("text") or "").strip()
         blocks.append(f"{header}\n{text}")
     return "\n\n---\n\n".join(blocks)
-
-
-def build_prompt(user_q: str, context: str) -> str:
-    return f"User question:\n{user_q}\n\nSources:\n{context}"
 
 
 def _copy_session_state(session_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1345,7 +1323,6 @@ class Retriever:
             )
 
         return {
-            "prompt": build_prompt(user_q, context),
             "results": results,
             "timing_start": t0,
         }
