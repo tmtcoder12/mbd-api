@@ -551,6 +551,24 @@ def _item_name_from_extra_metadata(row: Dict[str, Any]) -> str:
     return ""
 
 
+def _image_url_from_row(row: Dict[str, Any]) -> str:
+    direct = str(row.get("image_url") or "").strip()
+    if direct:
+        return direct
+
+    meta = row.get("extra_metadata")
+    if not isinstance(meta, dict):
+        return ""
+
+    for key, value in meta.items():
+        normalized = str(key or "").strip().lower().replace("-", "_")
+        if normalized == "image_url":
+            url = str(value or "").strip()
+            if url:
+                return url
+    return ""
+
+
 def _derive_image_title(row: Dict[str, Any], target_item_names: List[str]) -> str:
     from_meta = _item_name_from_extra_metadata(row)
     if from_meta:
@@ -603,7 +621,7 @@ def build_image_payload_from_decision(
     out: List[Dict[str, Any]] = []
     seen_urls = set()
     for row in ordered_rows:
-        image_url = str(row.get("image_url") or "").strip()
+        image_url = _image_url_from_row(row)
         if not image_url:
             continue
         if image_url in seen_urls:
@@ -1300,6 +1318,14 @@ class Retriever:
                     meta = extra.get("extra_metadata")
                     if isinstance(meta, dict) and meta:
                         row["extra_metadata"] = meta
+                        if not str(row.get("image_url") or "").strip():
+                            for mk, mv in meta.items():
+                                normalized = str(mk or "").strip().lower().replace("-", "_")
+                                if normalized == "image_url":
+                                    fallback_img = str(mv or "").strip()
+                                    if fallback_img:
+                                        row["image_url"] = fallback_img
+                                    break
             except SupabaseStoreError:
                 pass
 
