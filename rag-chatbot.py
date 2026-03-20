@@ -112,6 +112,12 @@ IMAGE_INTENT_KEYWORDS_PHOTO = (
 
 MAX_IMAGE_URLS_SENT = 3
 
+DEFAULT_IMAGE_DECISION = {
+    "include_images": False,
+    "max_images": 0,
+    "target_item_names": [],
+}
+
 QUERY_TYPE_LABELS = (
     "Operations",
     "Dietary",
@@ -441,22 +447,56 @@ def extract_active_constraints(user_query: str, previous: Dict[str, Any]) -> Dic
     return out
 
 
-def should_include_images(user_query: str, intent: Optional[str]) -> Tuple[bool, str]:
-    lowered = (user_query or "").lower()
-    if any(k in lowered for k in IMAGE_INTENT_KEYWORDS_PHOTO):
-        return True, "photo_keyword_match"
-    if any(k in lowered for k in IMAGE_INTENT_KEYWORDS_RECOMMEND):
-        return True, "recommendation_keyword_match"
-    if intent in {"compare_price", "lighter_option"} and "show" in lowered:
-        return True, "intent_plus_show"
-    return False, "no_image_intent"
+def _normalize_image_decision(raw: Any) -> Dict[str, Any]:
+    decision = dict(DEFAULT_IMAGE_DECISION)
+    if not isinstance(raw, dict):
+        return decision
+    include = bool(raw.get("include_images"))
+    max_images = raw.get("max_images", 0)
+    try:
+        max_images = int(max_images)
+    except (TypeError, ValueError):
+        max_images = 0
+    max_images = max(0, min(MAX_IMAGE_URLS_SENT, max_images))
+    names_raw = raw.get("target_item_names") or []
+    names: List[str] = []
+    if isinstance(names_raw, list):
+        for item in names_raw:
+            text = str(item or "").strip()
+            if text:
+                names.append(text)
+    decision["include_images"] = include
+    decision["max_images"] = max_images
+    decision["target_item_names"] = names[:5]
+    return decision
 
 
-def build_image_payload(results: List[Dict[str, Any]], max_images: int = MAX_IMAGE_URLS_SENT) -> List[Dict[str, Any]]:
+def build_image_payload_from_decision(
+    results: List[Dict[str, Any]],
+    image_decision: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    decision = _normalize_image_decision(image_decision)
+    if not decision["include_images"]:
+        return []
+
+    limit = int(decision["max_images"])
+    if limit <= 0:
+        return []
+
+    target_names = [str(x).lower() for x in decision.get("target_item_names") or [] if str(x).strip()]
+    prioritized: List[Dict[str, Any]] = []
+    non_prioritized: List[Dict[str, Any]] = []
+    for row in results:
+        blob = f"{row.get('title','')} {row.get('text','')}".lower()
+        if target_names and any(name in blob for name in target_names):
+            prioritized.append(row)
+        else:
+            non_prioritized.append(row)
+
+    ordered_rows = prioritized + non_prioritized
     out: List[Dict[str, Any]] = []
     seen_urls = set()
-    limit = max(1, int(max_images))
-    for row in results:
+    for row in ordered_rows:
         image_url = str(row.get("image_url") or "").strip()
         if not image_url:
             continue
@@ -774,6 +814,52 @@ def build_session_context(
     return json.dumps(context_payload, ensure_ascii=False)
 
 
+def _extract_first_json_object(raw: str) -> Optional[Dict[str, Any]]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = text[start : end + 1]
+    try:
+        obj = json.loads(snippet)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def _extract_assistant_response_and_images(raw_text: str) -> Tuple[str, Dict[str, Any]]:
+    default_text = (raw_text or "").strip()
+    if not default_text:
+        default_text = "I’m sorry, I couldn’t generate a response right now."
+
+    parsed = _extract_first_json_object(raw_text)
+    if not parsed:
+        return default_text, dict(DEFAULT_IMAGE_DECISION)
+
+    assistant_text = str(parsed.get("assistant_text") or "").strip()
+    if not assistant_text:
+        assistant_text = default_text
+    image_decision = _normalize_image_decision(parsed.get("image_decision"))
+    return assistant_text, image_decision
+
+
 def create_assistant_response(
     client: OpenAI,
     system_instructions: str,
@@ -781,14 +867,29 @@ def create_assistant_response(
     menu_context: str,
     session_context: str,
     previous_response_id: Optional[str],
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str], Dict[str, Any]]:
     user_payload = (
         "Session context:\n"
         f"{session_context}\n\n"
         "Retrieved menu context (facts):\n"
         f"{menu_context or '[no menu context found]'}\n\n"
         "Current user message:\n"
-        f"{user_query}"
+        f"{user_query}\n\n"
+        "Return ONLY a valid JSON object with this shape:\n"
+        "{\n"
+        '  "assistant_text": "string",\n'
+        '  "image_decision": {\n'
+        '    "include_images": true|false,\n'
+        '    "max_images": 0..3,\n'
+        '    "target_item_names": ["optional item names"]\n'
+        "  }\n"
+        "}\n"
+        "Rules:\n"
+        "- Keep assistant_text concise and natural.\n"
+        "- include_images=true only when user intent suggests recommendations or seeing photos.\n"
+        "- For one specific dish, prefer max_images=1 and set target_item_names.\n"
+        "- For broad recommendations, max_images can be up to 3.\n"
+        "- If no relevant photos should be shown, set include_images=false and max_images=0."
     )
     kwargs: Dict[str, Any] = {
         "model": CHAT_MODEL,
@@ -798,10 +899,9 @@ def create_assistant_response(
     if previous_response_id:
         kwargs["previous_response_id"] = previous_response_id
     resp = client.responses.create(**kwargs)
-    text = _extract_response_text(resp).strip()
-    if not text:
-        text = "I’m sorry, I couldn’t generate a response right now."
-    return text, getattr(resp, "id", None)
+    raw_text = _extract_response_text(resp).strip()
+    assistant_text, image_decision = _extract_assistant_response_and_images(raw_text)
+    return assistant_text, getattr(resp, "id", None), image_decision
 
 
 def infer_new_session_state(
@@ -871,6 +971,7 @@ def handle_chat_turn(
             "intent": intent,
             "active_constraints": active_constraints,
             "response_id": None,
+            "image_decision": dict(DEFAULT_IMAGE_DECISION),
             "new_session_state": new_state,
             "fallback_reason": "ambiguity",
         }
@@ -907,6 +1008,7 @@ def handle_chat_turn(
             "intent": intent,
             "active_constraints": active_constraints,
             "response_id": None,
+            "image_decision": dict(DEFAULT_IMAGE_DECISION),
             "new_session_state": new_state,
             "fallback_reason": "no_retrieval_results",
         }
@@ -918,7 +1020,7 @@ def handle_chat_turn(
         active_constraints=active_constraints,
     )
     menu_context = format_menu_context(results)
-    assistant_text, response_id = create_assistant_response(
+    assistant_text, response_id, image_decision = create_assistant_response(
         client=client,
         system_instructions=system_instructions,
         user_query=raw_query,
@@ -942,6 +1044,7 @@ def handle_chat_turn(
         "intent": intent,
         "active_constraints": active_constraints,
         "response_id": response_id,
+        "image_decision": image_decision,
         "new_session_state": new_state,
         "fallback_reason": None,
     }
@@ -1704,6 +1807,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 retrieved_item_ids=[str(r.get("id") or "") for r in results],
                 intent=turn.get("intent"),
                 active_constraints=turn.get("active_constraints"),
+                image_decision=turn.get("image_decision"),
                 response_id=turn.get("response_id"),
                 fallback_reason=turn.get("fallback_reason"),
             )
@@ -1712,35 +1816,35 @@ class ChatHandler(BaseHTTPRequestHandler):
                 line = json.dumps({"type": "delta", "content": assistant_text}, ensure_ascii=False) + "\n"
                 self._write_chunk(line)
 
-            turn_intent = turn.get("intent") if isinstance(turn, dict) else None
-            include_images, image_gate_reason = should_include_images(user_msg, turn_intent)
+            image_decision = dict(DEFAULT_IMAGE_DECISION)
+            if isinstance(turn, dict):
+                image_decision = _normalize_image_decision(turn.get("image_decision"))
             log_event(
-                "image_intent_gate",
+                "image_model_decision",
                 request_id=request_id,
                 restaurant_id=restaurant_id,
                 session_id=session_id,
-                include_images=include_images,
-                reason=image_gate_reason,
-                intent=turn_intent,
+                image_decision=image_decision,
+                intent=(turn.get("intent") if isinstance(turn, dict) else None),
             )
-            images_payload: List[Dict[str, Any]] = []
-            if include_images:
-                images_payload = build_image_payload(results, max_images=MAX_IMAGE_URLS_SENT)
-                if images_payload:
-                    images_line = json.dumps(
-                        {
-                            "type": "images",
-                            "images": images_payload,
-                        },
-                        ensure_ascii=False,
-                    ) + "\n"
-                    self._write_chunk(images_line)
+            images_payload = build_image_payload_from_decision(results, image_decision)
+            if images_payload:
+                images_line = json.dumps(
+                    {
+                        "type": "images",
+                        "images": images_payload,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+                self._write_chunk(images_line)
 
             log_event(
                 "images_emitted",
                 request_id=request_id,
                 restaurant_id=restaurant_id,
                 session_id=session_id,
+                include_images=bool(image_decision.get("include_images")),
+                requested_max_images=image_decision.get("max_images"),
                 images_emitted_count=len(images_payload),
                 image_chunk_ids=[x.get("chunk_id") for x in images_payload],
             )
