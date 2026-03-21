@@ -128,6 +128,8 @@ QUERY_CLASSIFIER_INSTRUCTIONS = (
 QUERY_CACHE_NAMESPACE_DEFAULT = "qcache:v1"
 QUERY_CACHE_TTL_SECONDS_DEFAULT = 900
 QUERY_CACHE_SCHEMA_VERSION = 1
+QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT = 0.8
+QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT = 200
 
 
 class SlidingWindowRateLimiter:
@@ -181,23 +183,114 @@ class RedisQueryCache:
             raise RuntimeError("redis package is required when query cache is enabled")
         self.client = redis.Redis.from_url(redis_url)
 
-    def get_json(self, key: str) -> Optional[Dict[str, Any]]:
-        raw = self.client.get(key)
+    def _loads_json(self, raw: Any) -> Optional[Dict[str, Any]]:
         if raw is None:
             return None
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         if not isinstance(raw, str) or not raw.strip():
             return None
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
         if isinstance(data, dict):
             return data
         return None
 
-    def set_json(self, key: str, payload: Dict[str, Any], ttl_seconds: int) -> None:
+    def _dumps_json(self, payload: Dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _entry_key(self, group_prefix: str, entry_id: str) -> str:
+        return f"{group_prefix}:entry:{entry_id}"
+
+    def _exact_map_key(self, group_prefix: str, exact_query_hash: str) -> str:
+        return f"{group_prefix}:exact:{exact_query_hash}"
+
+    def _normalized_map_key(self, group_prefix: str, normalized_query_hash: str) -> str:
+        return f"{group_prefix}:norm:{normalized_query_hash}"
+
+    def _semantic_recent_key(self, group_prefix: str) -> str:
+        return f"{group_prefix}:semantic:recent"
+
+    def lookup_exact(self, group_prefix: str, exact_query_hash: str) -> Optional[Dict[str, Any]]:
+        entry_id = self.client.get(self._exact_map_key(group_prefix, exact_query_hash))
+        if isinstance(entry_id, bytes):
+            entry_id = entry_id.decode("utf-8", errors="replace")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            return None
+        raw = self.client.get(self._entry_key(group_prefix, entry_id))
+        payload = self._loads_json(raw)
+        if payload is None:
+            self.client.delete(self._exact_map_key(group_prefix, exact_query_hash))
+        return payload
+
+    def lookup_normalized(self, group_prefix: str, normalized_query_hash: str) -> Optional[Dict[str, Any]]:
+        entry_id = self.client.get(self._normalized_map_key(group_prefix, normalized_query_hash))
+        if isinstance(entry_id, bytes):
+            entry_id = entry_id.decode("utf-8", errors="replace")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            return None
+        raw = self.client.get(self._entry_key(group_prefix, entry_id))
+        payload = self._loads_json(raw)
+        if payload is None:
+            self.client.delete(self._normalized_map_key(group_prefix, normalized_query_hash))
+        return payload
+
+    def semantic_candidates(self, group_prefix: str, max_candidates: int) -> List[Dict[str, Any]]:
+        limit = max(1, int(max_candidates))
+        zkey = self._semantic_recent_key(group_prefix)
+        entry_ids = self.client.zrevrange(zkey, 0, limit - 1)
+        if not entry_ids:
+            return []
+
+        normalized_ids: List[str] = []
+        for item in entry_ids:
+            if isinstance(item, bytes):
+                normalized_ids.append(item.decode("utf-8", errors="replace"))
+            else:
+                normalized_ids.append(str(item))
+
+        keys = [self._entry_key(group_prefix, entry_id) for entry_id in normalized_ids]
+        raws = self.client.mget(keys)
+        out: List[Dict[str, Any]] = []
+        stale_ids: List[str] = []
+        for entry_id, raw in zip(normalized_ids, raws):
+            payload = self._loads_json(raw)
+            if payload is None:
+                stale_ids.append(entry_id)
+                continue
+            payload["_entry_id"] = entry_id
+            out.append(payload)
+
+        if stale_ids:
+            self.client.zrem(zkey, *stale_ids)
+        return out
+
+    def store_entry(
+        self,
+        group_prefix: str,
+        exact_query_hash: str,
+        normalized_query_hash: str,
+        payload: Dict[str, Any],
+        ttl_seconds: int,
+    ) -> None:
         ttl = max(1, int(ttl_seconds))
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self.client.set(key, body, ex=ttl)
+        entry_id = str(uuid.uuid4())
+        entry_key = self._entry_key(group_prefix, entry_id)
+        exact_key = self._exact_map_key(group_prefix, exact_query_hash)
+        norm_key = self._normalized_map_key(group_prefix, normalized_query_hash)
+        zkey = self._semantic_recent_key(group_prefix)
+
+        body = self._dumps_json(payload)
+        now = time.time()
+        pipe = self.client.pipeline()
+        pipe.set(entry_key, body, ex=ttl)
+        pipe.set(exact_key, entry_id, ex=ttl)
+        pipe.set(norm_key, entry_id, ex=ttl)
+        pipe.zadd(zkey, {entry_id: now})
+        pipe.expire(zkey, ttl)
+        pipe.execute()
 
 
 def _b64url_decode(text: str) -> bytes:
@@ -489,8 +582,14 @@ def _normalize_image_decision(raw: Any) -> Dict[str, Any]:
     return decision
 
 
+def _exact_query_for_cache(user_query: str) -> str:
+    return (user_query or "").strip()
+
+
 def _normalize_query_for_cache(user_query: str) -> str:
-    return " ".join((user_query or "").strip().lower().split())
+    lowered = (user_query or "").strip().lower()
+    lowered = re.sub(r"[^\w\s]", " ", lowered)
+    return " ".join(lowered.split())
 
 
 def _is_followup_reference_query(user_query: str) -> bool:
@@ -528,6 +627,38 @@ def _hash_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _cache_namespace(namespace: str) -> str:
+    ns = (namespace or QUERY_CACHE_NAMESPACE_DEFAULT).strip()
+    return ns or QUERY_CACHE_NAMESPACE_DEFAULT
+
+
+def build_query_cache_context_hash(
+    restaurant_id: str,
+    system_instructions: str,
+    top_k: int,
+    min_score: float,
+    model: str = CHAT_MODEL,
+) -> str:
+    payload = {
+        "restaurant_id": str(restaurant_id or ""),
+        "model": str(model or ""),
+        "top_k": int(top_k),
+        "min_score": float(min_score),
+        "system_instructions_sha256": _hash_text(system_instructions or ""),
+    }
+    return _hash_text(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+
+
+def build_query_cache_group_prefix(
+    namespace: str,
+    restaurant_id: str,
+    context_hash: str,
+) -> str:
+    ns = _cache_namespace(namespace)
+    rid = str(restaurant_id or "")
+    return f"{ns}:{rid}:{context_hash}"
+
+
 def build_query_cache_key(
     namespace: str,
     restaurant_id: str,
@@ -537,20 +668,26 @@ def build_query_cache_key(
     min_score: float,
     model: str = CHAT_MODEL,
 ) -> str:
-    ns = (namespace or QUERY_CACHE_NAMESPACE_DEFAULT).strip() or QUERY_CACHE_NAMESPACE_DEFAULT
-    fingerprint = {
-        "q": _normalize_query_for_cache(user_query),
-        "restaurant_id": str(restaurant_id or ""),
-        "model": str(model or ""),
-        "top_k": int(top_k),
-        "min_score": float(min_score),
-        "system_instructions_sha256": _hash_text(system_instructions or ""),
-    }
-    digest = _hash_text(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False))
-    return f"{ns}:{restaurant_id}:{digest}"
+    context_hash = build_query_cache_context_hash(
+        restaurant_id=restaurant_id,
+        system_instructions=system_instructions,
+        top_k=top_k,
+        min_score=min_score,
+        model=model,
+    )
+    prefix = build_query_cache_group_prefix(namespace, restaurant_id, context_hash)
+    normalized_query = _normalize_query_for_cache(user_query)
+    digest = _hash_text(normalized_query)
+    return f"{prefix}:norm:{digest}"
 
 
-def _cacheable_turn_payload(turn: Dict[str, Any], ttl_seconds: int) -> Dict[str, Any]:
+def _cacheable_turn_payload(
+    turn: Dict[str, Any],
+    ttl_seconds: int,
+    exact_query: str,
+    normalized_query: str,
+    query_embedding: Optional[List[float]],
+) -> Dict[str, Any]:
     state = _copy_session_state(turn.get("new_session_state") or {})
     state["last_response_id"] = None
     payload = {
@@ -566,6 +703,9 @@ def _cacheable_turn_payload(turn: Dict[str, Any], ttl_seconds: int) -> Dict[str,
         "created_at": int(time.time()),
         "ttl_seconds": max(1, int(ttl_seconds)),
         "schema_version": QUERY_CACHE_SCHEMA_VERSION,
+        "cache_query_exact": exact_query,
+        "cache_query_normalized": normalized_query,
+        "cache_query_embedding": list(query_embedding or []),
     }
     return payload
 
@@ -601,6 +741,19 @@ def _turn_from_cached_payload(
         "fallback_reason": cached_payload.get("fallback_reason"),
         "cache_hit": True,
     }
+
+
+def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    if not vec_a or not vec_b:
+        return -1.0
+    a = [float(x) for x in vec_a]
+    b = [float(x) for x in vec_b]
+    if len(a) != len(b):
+        return -1.0
+    denom = (sum(x * x for x in a) ** 0.5) * (sum(x * x for x in b) ** 0.5)
+    if denom <= 1e-12:
+        return -1.0
+    return float(sum(x * y for x, y in zip(a, b)) / denom)
 
 
 def _title_from_page_path(page_path: str) -> str:
@@ -1195,18 +1348,27 @@ def handle_chat_turn(
     query_cache: Optional[RedisQueryCache] = None,
     query_cache_namespace: str = QUERY_CACHE_NAMESPACE_DEFAULT,
     query_cache_ttl_seconds: int = QUERY_CACHE_TTL_SECONDS_DEFAULT,
+    query_cache_semantic_threshold: float = QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT,
+    query_cache_semantic_max_candidates: int = QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     raw_query = (user_query or "").strip()
+    exact_query = _exact_query_for_cache(raw_query)
+    normalized_query = _normalize_query_for_cache(raw_query)
     intent = infer_intent(raw_query) or session_state.get("last_intent")
     active_constraints = extract_active_constraints(raw_query, session_state.get("active_constraints") or {})
     resolved_reference = resolve_reference(raw_query, session_state, store)
 
     cache_eligible, cache_reason = query_cache_eligibility(raw_query, session_state, resolved_reference)
-    cache_key_prefix = (
-        f"{(query_cache_namespace or QUERY_CACHE_NAMESPACE_DEFAULT).strip() or QUERY_CACHE_NAMESPACE_DEFAULT}:{restaurant_id}"
+    context_hash = build_query_cache_context_hash(
+        restaurant_id=restaurant_id,
+        system_instructions=system_instructions,
+        top_k=top_k,
+        min_score=min_score,
+        model=CHAT_MODEL,
     )
-    cache_key = ""
+    cache_key_prefix = build_query_cache_group_prefix(query_cache_namespace, restaurant_id, context_hash)
+    semantic_query_embedding: Optional[List[float]] = None
     if query_cache is not None:
         log_event(
             "query_cache_lookup",
@@ -1217,17 +1379,11 @@ def handle_chat_turn(
             key_prefix=cache_key_prefix,
         )
     if query_cache is not None and cache_eligible:
-        cache_key = build_query_cache_key(
-            namespace=query_cache_namespace,
-            restaurant_id=restaurant_id,
-            user_query=raw_query,
-            system_instructions=system_instructions,
-            top_k=top_k,
-            min_score=min_score,
-            model=CHAT_MODEL,
-        )
+        exact_hash = _hash_text(exact_query)
+        normalized_hash = _hash_text(normalized_query)
+
         try:
-            cached_payload = query_cache.get_json(cache_key)
+            cached_payload = query_cache.lookup_exact(cache_key_prefix, exact_hash)
         except Exception as exc:  # noqa: BLE001
             log_event(
                 "query_cache_error",
@@ -1238,30 +1394,181 @@ def handle_chat_turn(
                 key_prefix=cache_key_prefix,
             )
             cached_payload = None
-        cached_turn = _turn_from_cached_payload(cached_payload, session_state)
-        if cached_turn is not None:
+        if cached_payload is not None:
             log_event(
-                "query_cache_hit",
+                "query_cache_exact_hit",
                 request_id=request_id,
                 restaurant_id=restaurant_id,
                 key_prefix=cache_key_prefix,
             )
-            return cached_turn
+            cached_turn = _turn_from_cached_payload(cached_payload, session_state)
+            if cached_turn is not None:
+                cached_turn["cache_hit_stage"] = "exact"
+                log_event(
+                    "query_cache_hit",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    key_prefix=cache_key_prefix,
+                    stage="exact",
+                )
+                return cached_turn
         log_event(
-            "query_cache_miss",
+            "query_cache_exact_miss",
             request_id=request_id,
             restaurant_id=restaurant_id,
             key_prefix=cache_key_prefix,
         )
 
+        try:
+            cached_payload = query_cache.lookup_normalized(cache_key_prefix, normalized_hash)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                "query_cache_error",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                action="lookup_normalized",
+                error=str(exc),
+                key_prefix=cache_key_prefix,
+            )
+            cached_payload = None
+        if cached_payload is not None:
+            log_event(
+                "query_cache_normalized_hit",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+            )
+            cached_turn = _turn_from_cached_payload(cached_payload, session_state)
+            if cached_turn is not None:
+                cached_turn["cache_hit_stage"] = "normalized"
+                log_event(
+                    "query_cache_hit",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    key_prefix=cache_key_prefix,
+                    stage="normalized",
+                )
+                return cached_turn
+        log_event(
+            "query_cache_normalized_miss",
+            request_id=request_id,
+            restaurant_id=restaurant_id,
+            key_prefix=cache_key_prefix,
+        )
+
+        try:
+            semantic_query_embedding = embed_query(client, exact_query)[0].tolist()
+        except Exception as exc:  # noqa: BLE001
+            semantic_query_embedding = None
+            log_event(
+                "query_cache_error",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                action="semantic_embed",
+                error=str(exc),
+                key_prefix=cache_key_prefix,
+            )
+
+        best_payload: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+        if semantic_query_embedding:
+            try:
+                candidates = query_cache.semantic_candidates(
+                    cache_key_prefix,
+                    max_candidates=max(1, int(query_cache_semantic_max_candidates)),
+                )
+                for candidate in candidates:
+                    emb = candidate.get("cache_query_embedding")
+                    if not isinstance(emb, list):
+                        continue
+                    score = _cosine_similarity(semantic_query_embedding, emb)
+                    if score > best_score:
+                        best_score = score
+                        best_payload = candidate
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    "query_cache_error",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    action="lookup_semantic",
+                    error=str(exc),
+                    key_prefix=cache_key_prefix,
+                )
+
+        semantic_threshold = float(query_cache_semantic_threshold)
+        if best_payload is not None and best_score >= semantic_threshold:
+            log_event(
+                "query_cache_semantic_hit",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+                score=best_score,
+                threshold=semantic_threshold,
+            )
+            cached_turn = _turn_from_cached_payload(best_payload, session_state)
+            if cached_turn is not None:
+                cached_turn["cache_hit_stage"] = "semantic"
+                log_event(
+                    "query_cache_hit",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    key_prefix=cache_key_prefix,
+                    stage="semantic",
+                    score=best_score,
+                    threshold=semantic_threshold,
+                )
+                return cached_turn
+
+        log_event(
+            "query_cache_semantic_miss",
+            request_id=request_id,
+            restaurant_id=restaurant_id,
+            key_prefix=cache_key_prefix,
+            score=best_score if best_score >= 0 else None,
+            threshold=semantic_threshold,
+        )
+        log_event(
+            "query_cache_miss",
+            request_id=request_id,
+            restaurant_id=restaurant_id,
+            key_prefix=cache_key_prefix,
+            stage="all",
+        )
+
     retrieval_query = build_retrieval_query(raw_query, resolved_reference, intent, active_constraints)
 
     def _maybe_store_cache(turn_payload: Dict[str, Any]) -> None:
-        if query_cache is None or not cache_eligible or not cache_key:
+        nonlocal semantic_query_embedding
+        if query_cache is None or not cache_eligible:
             return
-        payload = _cacheable_turn_payload(turn_payload, query_cache_ttl_seconds)
+        if semantic_query_embedding is None:
+            try:
+                semantic_query_embedding = embed_query(client, exact_query)[0].tolist()
+            except Exception as exc:  # noqa: BLE001
+                semantic_query_embedding = []
+                log_event(
+                    "query_cache_error",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    action="store_embed",
+                    error=str(exc),
+                    key_prefix=cache_key_prefix,
+                )
+        payload = _cacheable_turn_payload(
+            turn_payload,
+            query_cache_ttl_seconds,
+            exact_query=exact_query,
+            normalized_query=normalized_query,
+            query_embedding=semantic_query_embedding,
+        )
         try:
-            query_cache.set_json(cache_key, payload, query_cache_ttl_seconds)
+            query_cache.store_entry(
+                cache_key_prefix,
+                exact_query_hash=_hash_text(exact_query),
+                normalized_query_hash=_hash_text(normalized_query),
+                payload=payload,
+                ttl_seconds=query_cache_ttl_seconds,
+            )
             log_event(
                 "query_cache_store",
                 request_id=request_id,
@@ -1572,6 +1879,8 @@ class ChatHandler(BaseHTTPRequestHandler):
     query_cache: Optional[RedisQueryCache] = None
     query_cache_ttl_seconds: int = QUERY_CACHE_TTL_SECONDS_DEFAULT
     query_cache_namespace: str = QUERY_CACHE_NAMESPACE_DEFAULT
+    query_cache_semantic_threshold: float = QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT
+    query_cache_semantic_max_candidates: int = QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT
     widget_signing_keys: Dict[str, bytes] = {}
     widget_active_kid: str = "v1"
     default_ip_max_requests: int = 30
@@ -2138,6 +2447,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 query_cache=self.query_cache,
                 query_cache_namespace=self.query_cache_namespace,
                 query_cache_ttl_seconds=self.query_cache_ttl_seconds,
+                query_cache_semantic_threshold=self.query_cache_semantic_threshold,
+                query_cache_semantic_max_candidates=self.query_cache_semantic_max_candidates,
                 request_id=request_id,
             )
             assistant_text = (turn.get("assistant_text") or "").strip()
@@ -2157,6 +2468,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 response_id=turn.get("response_id"),
                 fallback_reason=turn.get("fallback_reason"),
                 cache_hit=bool(turn.get("cache_hit")),
+                cache_hit_stage=turn.get("cache_hit_stage"),
             )
 
             if assistant_text:
@@ -2302,6 +2614,14 @@ def serve(top_k: int = 8, port: int = 8000):
     query_cache_enabled = parse_bool_env("QUERY_CACHE_ENABLED", bool(query_cache_redis_url))
     query_cache_ttl_seconds = int(os.getenv("QUERY_CACHE_TTL_SECONDS", str(QUERY_CACHE_TTL_SECONDS_DEFAULT)))
     query_cache_ttl_seconds = max(1, query_cache_ttl_seconds)
+    query_cache_semantic_threshold = float(
+        os.getenv("QUERY_CACHE_SEMANTIC_THRESHOLD", str(QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT))
+    )
+    query_cache_semantic_threshold = max(0.0, min(1.0, query_cache_semantic_threshold))
+    query_cache_semantic_max_candidates = int(
+        os.getenv("QUERY_CACHE_SEMANTIC_MAX_CANDIDATES", str(QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT))
+    )
+    query_cache_semantic_max_candidates = max(1, query_cache_semantic_max_candidates)
     query_cache_namespace = (os.getenv("QUERY_CACHE_NAMESPACE") or QUERY_CACHE_NAMESPACE_DEFAULT).strip()
     if not query_cache_namespace:
         query_cache_namespace = QUERY_CACHE_NAMESPACE_DEFAULT
@@ -2350,6 +2670,8 @@ def serve(top_k: int = 8, port: int = 8000):
         ChatHandler.query_cache = None
     ChatHandler.query_cache_ttl_seconds = query_cache_ttl_seconds
     ChatHandler.query_cache_namespace = query_cache_namespace
+    ChatHandler.query_cache_semantic_threshold = query_cache_semantic_threshold
+    ChatHandler.query_cache_semantic_max_candidates = query_cache_semantic_max_candidates
     ChatHandler.widget_signing_keys = widget_signing_keys
     ChatHandler.widget_active_kid = widget_active_kid
     ChatHandler.default_ip_max_requests = rate_limit_rpm
@@ -2382,7 +2704,10 @@ def serve(top_k: int = 8, port: int = 8000):
     print(f"   - Redis limiter: {'enabled' if redis_rate_limit_url else 'disabled (in-memory fallback)'}")
     if query_cache_enabled and query_cache_redis_url:
         print(
-            f"   - Query cache: enabled (redis, ttl={query_cache_ttl_seconds}s, namespace={query_cache_namespace})"
+            "   - Query cache: enabled "
+            f"(redis, ttl={query_cache_ttl_seconds}s, namespace={query_cache_namespace}, "
+            f"semantic_threshold={query_cache_semantic_threshold}, "
+            f"semantic_max_candidates={query_cache_semantic_max_candidates})"
         )
     else:
         print("   - Query cache: disabled")

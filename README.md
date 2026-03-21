@@ -147,6 +147,11 @@ Streaming event types:
 - `QUERY_CACHE_REDIS_URL` (defaults to `RATE_LIMIT_REDIS_URL` when omitted)
 - `QUERY_CACHE_TTL_SECONDS` (default: `900`)
 - `QUERY_CACHE_NAMESPACE` (default: `qcache:v1`)
+- `QUERY_CACHE_SEMANTIC_THRESHOLD` (default: `0.8`)
+- `QUERY_CACHE_SEMANTIC_MAX_CANDIDATES` (default: `200`)
+
+When query caching is enabled, standalone-eligible requests use staged matching:
+exact query -> normalized query -> semantic similarity -> normal LLM flow.
 
 ## Retrieval Backend
 
