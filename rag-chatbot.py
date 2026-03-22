@@ -130,6 +130,94 @@ QUERY_CACHE_TTL_SECONDS_DEFAULT = 900
 QUERY_CACHE_SCHEMA_VERSION = 1
 QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT = 0.8
 QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT = 200
+QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT = True
+
+RESTAURANT_RELEVANCE_KEYWORDS = {
+    "menu",
+    "menus",
+    "item",
+    "items",
+    "dish",
+    "dishes",
+    "food",
+    "drink",
+    "drinks",
+    "beverage",
+    "beverages",
+    "cocktail",
+    "cocktails",
+    "mocktail",
+    "mocktails",
+    "special",
+    "specials",
+    "popular",
+    "best",
+    "recommend",
+    "recommended",
+    "recommendation",
+    "recommendations",
+    "recs",
+    "suggest",
+    "suggestion",
+    "suggestions",
+    "hours",
+    "open",
+    "close",
+    "closing",
+    "location",
+    "address",
+    "parking",
+    "reservation",
+    "reservations",
+    "book",
+    "booking",
+    "waitlist",
+    "delivery",
+    "pickup",
+    "takeout",
+    "dinein",
+    "dine",
+    "price",
+    "prices",
+    "cost",
+    "costs",
+    "cheap",
+    "cheaper",
+    "cheapest",
+    "dietary",
+    "allergen",
+    "allergens",
+    "allergy",
+    "allergies",
+    "gluten",
+    "vegan",
+    "vegetarian",
+    "spicy",
+    "catering",
+    "event",
+    "events",
+    "party",
+    "parties",
+    "private",
+    "payment",
+    "payments",
+    "pay",
+}
+
+RESTAURANT_RELEVANCE_PHRASES = (
+    "what are your hours",
+    "when are you open",
+    "where are you located",
+    "do you have parking",
+    "do you take reservations",
+    "can i reserve",
+    "can i book",
+    "do you deliver",
+    "do you do takeout",
+    "what are your specials",
+    "what do you recommend",
+    "top picks",
+)
 
 
 class SlidingWindowRateLimiter:
@@ -606,20 +694,39 @@ def _is_followup_reference_query(user_query: str) -> bool:
     return bool(re.search(pattern, lowered))
 
 
+def is_restaurant_relevant_query(user_query: str, inferred_intent: Optional[str]) -> bool:
+    if inferred_intent:
+        return True
+    normalized = _normalize_query_for_cache(user_query)
+    if not normalized:
+        return False
+    if any(phrase in normalized for phrase in RESTAURANT_RELEVANCE_PHRASES):
+        return True
+    tokens = set(normalized.split())
+    if tokens.intersection(RESTAURANT_RELEVANCE_KEYWORDS):
+        return True
+    if tokens.intersection(CATEGORY_KEYWORDS):
+        return True
+    return False
+
+
 def query_cache_eligibility(
     user_query: str,
     session_state: Dict[str, Any],
     resolved_reference: Dict[str, Any],
+    inferred_intent: Optional[str] = None,
+    require_restaurant_relevance: bool = QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT,
 ) -> Tuple[bool, str]:
+    _ = session_state
     if not (user_query or "").strip():
         return False, "empty_query"
-    if session_state.get("last_response_id"):
-        return False, "has_previous_response_id"
     status = str(resolved_reference.get("status") or "")
     if status in {"resolved", "ambiguous"}:
         return False, f"reference_status_{status}"
     if _is_followup_reference_query(user_query):
         return False, "followup_reference_pattern"
+    if require_restaurant_relevance and not is_restaurant_relevant_query(user_query, inferred_intent):
+        return False, "non_restaurant_query"
     return True, "eligible"
 
 
@@ -1350,16 +1457,24 @@ def handle_chat_turn(
     query_cache_ttl_seconds: int = QUERY_CACHE_TTL_SECONDS_DEFAULT,
     query_cache_semantic_threshold: float = QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT,
     query_cache_semantic_max_candidates: int = QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT,
+    query_cache_require_restaurant_relevance: bool = QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     raw_query = (user_query or "").strip()
     exact_query = _exact_query_for_cache(raw_query)
     normalized_query = _normalize_query_for_cache(raw_query)
-    intent = infer_intent(raw_query) or session_state.get("last_intent")
+    inferred_intent = infer_intent(raw_query)
+    intent = inferred_intent or session_state.get("last_intent")
     active_constraints = extract_active_constraints(raw_query, session_state.get("active_constraints") or {})
     resolved_reference = resolve_reference(raw_query, session_state, store)
 
-    cache_eligible, cache_reason = query_cache_eligibility(raw_query, session_state, resolved_reference)
+    cache_eligible, cache_reason = query_cache_eligibility(
+        raw_query,
+        session_state,
+        resolved_reference,
+        inferred_intent=inferred_intent,
+        require_restaurant_relevance=query_cache_require_restaurant_relevance,
+    )
     context_hash = build_query_cache_context_hash(
         restaurant_id=restaurant_id,
         system_instructions=system_instructions,
@@ -1881,6 +1996,7 @@ class ChatHandler(BaseHTTPRequestHandler):
     query_cache_namespace: str = QUERY_CACHE_NAMESPACE_DEFAULT
     query_cache_semantic_threshold: float = QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT
     query_cache_semantic_max_candidates: int = QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT
+    query_cache_require_restaurant_relevance: bool = QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT
     widget_signing_keys: Dict[str, bytes] = {}
     widget_active_kid: str = "v1"
     default_ip_max_requests: int = 30
@@ -2449,6 +2565,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 query_cache_ttl_seconds=self.query_cache_ttl_seconds,
                 query_cache_semantic_threshold=self.query_cache_semantic_threshold,
                 query_cache_semantic_max_candidates=self.query_cache_semantic_max_candidates,
+                query_cache_require_restaurant_relevance=self.query_cache_require_restaurant_relevance,
                 request_id=request_id,
             )
             assistant_text = (turn.get("assistant_text") or "").strip()
@@ -2622,6 +2739,10 @@ def serve(top_k: int = 8, port: int = 8000):
         os.getenv("QUERY_CACHE_SEMANTIC_MAX_CANDIDATES", str(QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT))
     )
     query_cache_semantic_max_candidates = max(1, query_cache_semantic_max_candidates)
+    query_cache_require_restaurant_relevance = parse_bool_env(
+        "QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE",
+        QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT,
+    )
     query_cache_namespace = (os.getenv("QUERY_CACHE_NAMESPACE") or QUERY_CACHE_NAMESPACE_DEFAULT).strip()
     if not query_cache_namespace:
         query_cache_namespace = QUERY_CACHE_NAMESPACE_DEFAULT
@@ -2672,6 +2793,7 @@ def serve(top_k: int = 8, port: int = 8000):
     ChatHandler.query_cache_namespace = query_cache_namespace
     ChatHandler.query_cache_semantic_threshold = query_cache_semantic_threshold
     ChatHandler.query_cache_semantic_max_candidates = query_cache_semantic_max_candidates
+    ChatHandler.query_cache_require_restaurant_relevance = query_cache_require_restaurant_relevance
     ChatHandler.widget_signing_keys = widget_signing_keys
     ChatHandler.widget_active_kid = widget_active_kid
     ChatHandler.default_ip_max_requests = rate_limit_rpm
@@ -2707,7 +2829,8 @@ def serve(top_k: int = 8, port: int = 8000):
             "   - Query cache: enabled "
             f"(redis, ttl={query_cache_ttl_seconds}s, namespace={query_cache_namespace}, "
             f"semantic_threshold={query_cache_semantic_threshold}, "
-            f"semantic_max_candidates={query_cache_semantic_max_candidates})"
+            f"semantic_max_candidates={query_cache_semantic_max_candidates}, "
+            f"require_restaurant_relevance={'yes' if query_cache_require_restaurant_relevance else 'no'})"
         )
     else:
         print("   - Query cache: disabled")

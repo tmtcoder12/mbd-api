@@ -149,9 +149,12 @@ Streaming event types:
 - `QUERY_CACHE_NAMESPACE` (default: `qcache:v1`)
 - `QUERY_CACHE_SEMANTIC_THRESHOLD` (default: `0.8`)
 - `QUERY_CACHE_SEMANTIC_MAX_CANDIDATES` (default: `200`)
+- `QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE` (default: `true`)
 
-When query caching is enabled, standalone-eligible requests use staged matching:
+When query caching is enabled, eligible requests use staged matching:
 exact query -> normalized query -> semantic similarity -> normal LLM flow.
+
+Eligibility excludes follow-up/reference-style turns and (by default) non-restaurant queries.
 
 ## Retrieval Backend
 
