@@ -219,6 +219,31 @@ RESTAURANT_RELEVANCE_PHRASES = (
     "top picks",
 )
 
+CONTEXT_RESET_KEYWORDS = {
+    "hour",
+    "hours",
+    "open",
+    "close",
+    "closing",
+    "location",
+    "address",
+    "parking",
+    "reservation",
+    "reservations",
+    "waitlist",
+    "delivery",
+    "pickup",
+    "takeout",
+    "catering",
+    "event",
+    "events",
+    "payment",
+    "payments",
+    "pay",
+    "phone",
+    "contact",
+}
+
 
 class SlidingWindowRateLimiter:
     def __init__(self, max_requests: int, window_seconds: int):
@@ -692,6 +717,53 @@ def _is_followup_reference_query(user_query: str) -> bool:
         r")\b"
     )
     return bool(re.search(pattern, lowered))
+
+
+def _looks_contextual_followup_query(user_query: str) -> bool:
+    normalized = _normalize_query_for_cache(user_query)
+    if not normalized:
+        return False
+    if _is_followup_reference_query(user_query):
+        return True
+    followup_starts = (
+        "what about",
+        "how about",
+        "and",
+        "also",
+        "anything",
+        "something",
+        "what else",
+        "anything else",
+        "other options",
+        "another option",
+    )
+    if any(normalized.startswith(p) for p in followup_starts):
+        return True
+    return False
+
+
+def should_reuse_session_context(
+    user_query: str,
+    resolved_reference: Dict[str, Any],
+    inferred_intent: Optional[str],
+) -> bool:
+    status = str(resolved_reference.get("status") or "")
+    if status in {"resolved", "ambiguous"}:
+        return True
+    if _looks_contextual_followup_query(user_query):
+        return True
+
+    normalized = _normalize_query_for_cache(user_query)
+    if not normalized:
+        return False
+    tokens = set(normalized.split())
+    if tokens.intersection(CONTEXT_RESET_KEYWORDS):
+        return False
+
+    # Very short intent checks are often elliptical follow-ups ("spicy?", "vegetarian?").
+    if inferred_intent in {"spice_check", "dietary_check", "lighter_option"} and len(tokens) <= 3:
+        return True
+    return False
 
 
 def is_restaurant_relevant_query(user_query: str, inferred_intent: Optional[str]) -> bool:
@@ -1464,9 +1536,13 @@ def handle_chat_turn(
     exact_query = _exact_query_for_cache(raw_query)
     normalized_query = _normalize_query_for_cache(raw_query)
     inferred_intent = infer_intent(raw_query)
-    intent = inferred_intent or session_state.get("last_intent")
-    active_constraints = extract_active_constraints(raw_query, session_state.get("active_constraints") or {})
     resolved_reference = resolve_reference(raw_query, session_state, store)
+    reuse_session_context = should_reuse_session_context(raw_query, resolved_reference, inferred_intent)
+    intent = inferred_intent or (session_state.get("last_intent") if reuse_session_context else None)
+    base_constraints = session_state.get("active_constraints") or {}
+    if not reuse_session_context:
+        base_constraints = {}
+    active_constraints = extract_active_constraints(raw_query, base_constraints)
 
     cache_eligible, cache_reason = query_cache_eligibility(
         raw_query,
