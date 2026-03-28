@@ -120,13 +120,9 @@ QUERY_TYPE_LABELS = (
 )
 
 QUERY_CLASSIFIER_INSTRUCTIONS = (
-    "Classify the user's restaurant query and detect the language of the user's message.\n"
-    "Allowed query_type labels: Operations, Dietary, Events, Menu, Transactions.\n"
-    "Return exactly one JSON object with this schema:\n"
-    "{\"query_type\":\"<allowed label>\",\"language\":\"<ISO 639-1 lowercase code or 'und'>\"}\n"
-    "Language must describe the user's query language, not the restaurant's locale.\n"
-    "Use 'und' only when the language cannot be determined confidently.\n"
-    "Return JSON only. No markdown, no prose."
+    "Classify the user's restaurant query into exactly one category.\n"
+    "Allowed labels: Operations, Dietary, Events, Menu, Transactions.\n"
+    "Return exactly one label and no other text."
 )
 
 QUERY_CACHE_NAMESPACE_DEFAULT = "qcache:v1"
@@ -1910,86 +1906,7 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
     return None
 
 
-def normalize_language_label(raw: Any) -> Optional[str]:
-    value = str(raw or "").strip().strip("\"'`")
-    if not value:
-        return None
-
-    alias_map = {
-        "english": "en",
-        "spanish": "es",
-        "french": "fr",
-        "german": "de",
-        "italian": "it",
-        "portuguese": "pt",
-        "brazilian portuguese": "pt-BR",
-        "chinese": "zh",
-        "simplified chinese": "zh-Hans",
-        "traditional chinese": "zh-Hant",
-        "japanese": "ja",
-        "korean": "ko",
-        "arabic": "ar",
-        "hindi": "hi",
-        "punjabi": "pa",
-        "urdu": "ur",
-        "russian": "ru",
-        "ukrainian": "uk",
-        "vietnamese": "vi",
-        "thai": "th",
-        "turkish": "tr",
-        "dutch": "nl",
-        "polish": "pl",
-        "indonesian": "id",
-        "malay": "ms",
-        "tagalog": "tl",
-        "filipino": "fil",
-        "persian": "fa",
-        "farsi": "fa",
-        "hebrew": "he",
-        "greek": "el",
-        "und": "und",
-        "unknown": "und",
-        "undetermined": "und",
-    }
-    lowered = value.lower()
-    if lowered in alias_map:
-        value = alias_map[lowered]
-
-    parts = [part for part in value.replace("_", "-").split("-") if part]
-    if not parts:
-        return None
-
-    primary = parts[0].lower()
-    if primary != "und" and not re.fullmatch(r"[a-z]{2,3}", primary):
-        return None
-
-    normalized_parts = [primary]
-    for part in parts[1:]:
-        if len(part) == 4 and part.isalpha():
-            normalized_parts.append(part.title())
-        elif (len(part) == 2 and part.isalpha()) or (len(part) == 3 and part.isdigit()):
-            normalized_parts.append(part.upper())
-        elif re.fullmatch(r"[A-Za-z0-9]{5,8}", part):
-            normalized_parts.append(part.lower())
-        else:
-            return None
-    return "-".join(normalized_parts)
-
-
-def parse_query_classification(raw: str) -> Tuple[Optional[str], Optional[str]]:
-    parsed = _extract_first_json_object(raw)
-    if not parsed:
-        return normalize_query_type_label(raw), None
-    query_type = normalize_query_type_label(parsed.get("query_type"))
-    language = normalize_language_label(parsed.get("language"))
-    return query_type, language
-
-
-def classify_query_metadata(
-    client: OpenAI,
-    model: str,
-    user_query: str,
-) -> Tuple[Optional[str], Optional[str], str, Dict[str, Any]]:
+def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str, Dict[str, Any]]:
     t0 = time.perf_counter()
 
     resp = client.responses.create(
@@ -2041,8 +1958,7 @@ def classify_query_metadata(
         "latency_ms": int((time.perf_counter() - t0) * 1000),
     }
 
-    query_type, language = parse_query_classification(raw)
-    return query_type, language, raw, meta
+    return normalize_query_type_label(raw), raw, meta
 
 
 class Retriever:
@@ -2338,7 +2254,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 error=str(exc),
             )
 
-    def _schedule_query_classification(
+    def _schedule_query_type_classification(
         self,
         message_id: Optional[str],
         user_query: str,
@@ -2371,7 +2287,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 prompt_hash=hashlib.sha256(QUERY_CLASSIFIER_INSTRUCTIONS.encode("utf-8")).hexdigest()[:16],
             )
             try:
-                label, language, raw_label_output, meta = classify_query_metadata(client, model, user_query)
+                label, raw_label_output, meta = classify_query_type(client, model, user_query)
                 log_event(
                     "query_classification_llm_response",
                     request_id=request_id,
@@ -2396,14 +2312,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                         latency_ms=int((time.perf_counter() - t0) * 1000),
                     )
                     return
-                store.update_message_classification(message_id, label, language)
+                store.update_message_query_type(message_id, label)
                 log_event(
                     "query_classification_complete",
                     request_id=request_id,
                     restaurant_id=restaurant_id,
                     message_id=message_id,
                     query_type=label,
-                    language=language,
                     latency_ms=int((time.perf_counter() - t0) * 1000),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -2790,7 +2705,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._write_chunk(done_line)
             self._end_chunked()
 
-            self._schedule_query_classification(
+            self._schedule_query_type_classification(
                 user_message_id,
                 user_msg,
                 restaurant_id=restaurant_id,
@@ -2833,7 +2748,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 pass
 
-            self._schedule_query_classification(
+            self._schedule_query_type_classification(
                 user_message_id,
                 user_msg,
                 restaurant_id=restaurant_id,

@@ -247,7 +247,6 @@ class SupabaseStore:
         latency_ms: Optional[int] = None,
         delivery_status: str = "complete",
         query_type: Optional[str] = None,
-        language: Optional[str] = None,
         return_row: bool = False,
     ) -> Optional[Dict[str, Any]]:
         payload = {
@@ -258,7 +257,6 @@ class SupabaseStore:
             "latency_ms": latency_ms,
             "delivery_status": delivery_status,
             "query_type": query_type,
-            "language": language,
         }
         data = self._request(
             "POST",
@@ -282,28 +280,6 @@ class SupabaseStore:
         if not qtype:
             raise SupabaseStoreError("query_type is required")
         payload = {"query_type": qtype}
-        self._request(
-            "PATCH",
-            "/rest/v1/chat_messages",
-            payload=payload,
-            query={"id": f"eq.{mid}"},
-            prefer="return=minimal",
-        )
-
-    def update_message_classification(
-        self,
-        message_id: str,
-        query_type: str,
-        language: Optional[str] = None,
-    ) -> None:
-        mid = self._require_uuid(message_id, "message_id")
-        qtype = (query_type or "").strip()
-        if not qtype:
-            raise SupabaseStoreError("query_type is required")
-        payload = {"query_type": qtype}
-        lang = (language or "").strip()
-        if lang:
-            payload["language"] = lang
         self._request(
             "PATCH",
             "/rest/v1/chat_messages",
