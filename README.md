@@ -171,7 +171,7 @@ Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.
 - session upsert
 - session state persistence (`chat_session_state`)
 - chat message persistence
-- async query classification writeback (`chat_messages.query_type`)
+- async query classification writeback (`chat_messages.query_type`, `chat_messages.language`)
 - vector retrieval (`match_chunks`)
 - ingest run/chunk upserts (utility methods)
 
