@@ -31,9 +31,10 @@ High-level request flow:
 3. Enforce origin allowlist for that restaurant.
 4. Enforce rate limits (token issuance, IP, session).
 5. For chat: verify `widgetToken` (HS256, `kid`, `rid`, `orig`, `exp`).
-6. Retrieve relevant chunks from Supabase pgvector.
-7. Stream model deltas as NDJSON chunked transfer.
-8. Optionally persist session/messages/sources to Supabase.
+6. Resolve session language (`language` payload -> stored session language -> `eng`) and apply it to the restaurant system prompt.
+7. Retrieve relevant chunks from Supabase pgvector.
+8. Stream model deltas as NDJSON chunked transfer.
+9. Optionally persist session/messages/sources to Supabase.
 
 ## API Endpoints
 
@@ -88,11 +89,13 @@ Required:
   "message": "What are your most popular dishes?",
   "restaurantId": "11111111-1111-1111-1111-111111111111",
   "sessionToken": "22222222-2222-2222-2222-222222222222",
-  "widgetToken": "<jwt from /api/widget-token>"
+  "widgetToken": "<jwt from /api/widget-token>",
+  "language": "eng"
 }
 ```
 
 `sessionToken` is optional; if omitted, server generates one and sends it in first stream event.
+`language` is optional; when omitted, the backend uses the stored session language or defaults to `eng`.
 
 Streaming event types:
 
@@ -181,16 +184,18 @@ Expected backend tables/RPC include (at minimum):
 - `restaurant_allowed_origins`
 - `restaurant_security_settings`
 - `audit_events`
+- `chat_sessions`
 - `chat_session_state`
 - `chat_messages`
 - RPC: `upsert_session`, `match_chunks`
 
-## Session State Schema
+## Migrations
 
-Apply migration:
+Apply migrations:
 
 ```bash
 psql "$DATABASE_URL" -f migrations/20260317_chat_session_state.sql
+psql "$DATABASE_URL" -f migrations/20260328_chat_session_language.sql
 ```
 
 ## Run Locally

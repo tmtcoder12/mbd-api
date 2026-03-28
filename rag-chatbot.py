@@ -13,6 +13,7 @@ Request body for POST /api/chat-stream must include:
   restaurantId: UUID string
   sessionToken: UUID string (optional; server generates if missing)
   widgetToken: signed JWT (required)
+  language: ISO 639-3 string (optional; defaults to session language or eng)
 """
 
 import json
@@ -59,6 +60,95 @@ DEFAULT_SYSTEM_INSTRUCTIONS = (
     "If reference ambiguity is high, ask one short clarifying question.\n"
     "Mention specific item names clearly instead of vague pronouns.\n"
     "Do not invent ingredients, prices, sides, dietary tags, or availability."
+)
+
+DEFAULT_SESSION_LANGUAGE = "eng"
+
+# Keep this allowlist aligned with the frontend language selector.
+SUPPORTED_SESSION_LANGUAGE_CODES = frozenset(
+    {
+        "afr",
+        "amh",
+        "ara",
+        "asm",
+        "aze",
+        "bel",
+        "ben",
+        "bos",
+        "bul",
+        "cat",
+        "ces",
+        "cmn",
+        "cym",
+        "dan",
+        "deu",
+        "ell",
+        "eng",
+        "est",
+        "eus",
+        "fas",
+        "fil",
+        "fin",
+        "fra",
+        "gle",
+        "glg",
+        "guj",
+        "heb",
+        "hin",
+        "hrv",
+        "hun",
+        "hye",
+        "ind",
+        "isl",
+        "ita",
+        "jpn",
+        "kan",
+        "kat",
+        "kaz",
+        "khm",
+        "kir",
+        "kor",
+        "lao",
+        "lav",
+        "lit",
+        "mal",
+        "mar",
+        "mkd",
+        "mlt",
+        "mon",
+        "msa",
+        "mya",
+        "nep",
+        "nld",
+        "nor",
+        "pan",
+        "pol",
+        "por",
+        "ron",
+        "rus",
+        "sin",
+        "slk",
+        "slv",
+        "som",
+        "spa",
+        "sqi",
+        "srp",
+        "swa",
+        "swe",
+        "tam",
+        "tel",
+        "tha",
+        "tgl",
+        "tur",
+        "ukr",
+        "urd",
+        "uzb",
+        "vie",
+        "xho",
+        "yue",
+        "zho",
+        "zul",
+    }
 )
 
 DEFAULT_SESSION_STATE = {
@@ -559,6 +649,20 @@ def normalize_restaurant_id(restaurant_id: str) -> str:
         return str(uuid.UUID(raw))
     except ValueError as exc:
         raise ValueError("restaurantId must be a valid UUID") from exc
+
+
+def normalize_session_language(language: Any) -> Optional[str]:
+    if language is None:
+        return None
+    raw = str(language).strip()
+    if not raw:
+        raise ValueError("language must be a 3-letter ISO 639-3 code")
+    code = raw.lower()
+    if not re.fullmatch(r"[a-z]{3}", code):
+        raise ValueError("language must be a 3-letter ISO 639-3 code")
+    if code not in SUPPORTED_SESSION_LANGUAGE_CODES:
+        raise ValueError("language must be a supported ISO 639-3 code")
+    return code
 
 
 def embed_query(client: OpenAI, text: str) -> np.ndarray:
@@ -2204,17 +2308,22 @@ class ChatHandler(BaseHTTPRequestHandler):
             return None
         return settings
 
-    def _load_system_instructions(self, restaurant_id: str, request_id: str) -> Optional[str]:
+    def _load_system_instructions(
+        self,
+        restaurant_id: str,
+        request_id: str,
+        language: str = DEFAULT_SESSION_LANGUAGE,
+    ) -> Optional[str]:
         if self.store is None:
-            return DEFAULT_SYSTEM_INSTRUCTIONS
+            return DEFAULT_SYSTEM_INSTRUCTIONS.replace("{language}", language)
         try:
             custom_prompt = self.store.get_restaurant_system_prompt(restaurant_id)
         except SupabaseStoreError as exc:
             self._send_json_error(502, f"Failed to load restaurant system_prompt: {exc}", request_id=request_id)
             return None
         if custom_prompt:
-            return custom_prompt
-        return DEFAULT_SYSTEM_INSTRUCTIONS
+            return custom_prompt.replace("{language}", language)
+        return DEFAULT_SYSTEM_INSTRUCTIONS.replace("{language}", language)
 
     def _load_session_state(self, session_id: str, request_id: str) -> Dict[str, Any]:
         if self.store is None:
@@ -2444,6 +2553,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc), request_id=request_id)
             return
 
+        try:
+            requested_language = normalize_session_language(payload.get("language"))
+        except ValueError as exc:
+            self._send_json_error(400, str(exc), request_id=request_id)
+            return
+
         security_settings = self._load_security_settings(restaurant_id, request_id)
         if security_settings is None:
             return
@@ -2531,6 +2646,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc), request_id=request_id)
             return
 
+        try:
+            requested_language = normalize_session_language(payload.get("language"))
+        except ValueError as exc:
+            self._send_json_error(400, str(exc), request_id=request_id)
+            return
+
         security_settings = self._load_security_settings(restaurant_id, request_id)
         if security_settings is None:
             return
@@ -2548,10 +2669,6 @@ class ChatHandler(BaseHTTPRequestHandler):
             )
         except ValueError as exc:
             self._send_json_error(403, str(exc), request_id=request_id)
-            return
-
-        system_instructions = self._load_system_instructions(restaurant_id, request_id)
-        if system_instructions is None:
             return
 
         client_ip_hash = hash_client_ip(self._client_ip())
@@ -2579,19 +2696,41 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         session_id = None
         user_message_id = None
+        resolved_language = DEFAULT_SESSION_LANGUAGE
         if self.store is None:
             self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
             return
         try:
-            session_id = self.store.upsert_session(restaurant_id, session_token, self._extract_client_meta())
+            session_row = self.store.upsert_session(
+                restaurant_id,
+                session_token,
+                self._extract_client_meta(),
+                language=requested_language,
+            )
+            session_id = str(session_row.get("session_id") or "")
+            if not session_id:
+                raise SupabaseStoreError("upsert_session did not return session_id")
+            try:
+                stored_language = normalize_session_language(session_row.get("language"))
+            except ValueError:
+                stored_language = None
+            resolved_language = stored_language or requested_language or DEFAULT_SESSION_LANGUAGE
             if self.persist_chat:
                 user_row = self.store.insert_message(session_id, "user", user_msg, return_row=True)
                 if user_row is not None:
                     row_id = user_row.get("id")
                     if row_id:
                         user_message_id = str(row_id)
-        except SupabaseStoreError as exc:
+        except (SupabaseStoreError, ValueError) as exc:
             self._send_json_error(502, f"Failed to persist chat session: {exc}", request_id=request_id)
+            return
+
+        system_instructions = self._load_system_instructions(
+            restaurant_id,
+            request_id,
+            language=resolved_language,
+        )
+        if system_instructions is None:
             return
 
         self.send_response(200)
@@ -2622,6 +2761,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 request_id=request_id,
                 restaurant_id=restaurant_id,
                 session_id=session_id,
+                language=resolved_language,
                 raw_user_query=user_msg,
                 previous_response_id=session_state.get("last_response_id"),
             )
@@ -2652,6 +2792,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 request_id=request_id,
                 restaurant_id=restaurant_id,
                 session_id=session_id,
+                language=resolved_language,
                 resolved_reference=turn.get("resolved_reference"),
                 rewritten_retrieval_query=turn.get("retrieval_query"),
                 retrieved_item_ids=[str(r.get("id") or "") for r in results],
@@ -2736,6 +2877,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 restaurant_id=restaurant_id,
                 origin=origin,
                 client_ip_hash=client_ip_hash,
+                language=resolved_language,
                 status=200,
                 latency_ms=int((time.perf_counter() - start) * 1000),
                 sources_count=len(results),
@@ -2774,6 +2916,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 restaurant_id=restaurant_id,
                 origin=origin,
                 client_ip_hash=client_ip_hash,
+                language=resolved_language,
                 status=500,
                 error=str(exc),
                 latency_ms=int((time.perf_counter() - start) * 1000),

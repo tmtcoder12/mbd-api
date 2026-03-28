@@ -215,12 +215,14 @@ class SupabaseStore:
         restaurant_id: str,
         session_token: str,
         client_meta: Optional[Dict[str, Any]] = None,
-    ) -> str:
+        language: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
         rid = self._require_uuid(restaurant_id, "restaurant_id")
         payload = {
             "p_restaurant_id": rid,
             "p_session_token": session_token,
             "p_client_meta": client_meta or {},
+            "p_language": (language or "").strip() or None,
         }
         data = self._request("POST", "/rest/v1/rpc/upsert_session", payload=payload)
 
@@ -228,13 +230,26 @@ class SupabaseStore:
             row = data[0]
             sid = row.get("session_id")
             if sid:
-                return str(sid)
+                raw_language = row.get("language")
+                session_language = str(raw_language).strip() if raw_language is not None else None
+                return {
+                    "session_id": str(sid),
+                    "language": session_language or None,
+                }
         if isinstance(data, dict):
             sid = data.get("session_id")
             if sid:
-                return str(sid)
+                raw_language = data.get("language")
+                session_language = str(raw_language).strip() if raw_language is not None else None
+                return {
+                    "session_id": str(sid),
+                    "language": session_language or None,
+                }
         if isinstance(data, str) and data:
-            return data
+            return {
+                "session_id": data,
+                "language": (language or "").strip() or None,
+            }
 
         raise SupabaseStoreError("upsert_session did not return session_id")
 
