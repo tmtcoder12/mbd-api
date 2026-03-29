@@ -211,7 +211,7 @@ QUERY_TYPE_LABELS = (
 
 QUERY_CLASSIFIER_INSTRUCTIONS = (
     "Classify the user's restaurant query into exactly one category.\n"
-    "Allowed labels: Operations, Dietary, Events, Menu, Transactions.\n"
+    "Allowed labels: Operations, Dietary, Events, Menu, Transactions, Other.\n"
     "Return exactly one label and no other text."
 )
 
