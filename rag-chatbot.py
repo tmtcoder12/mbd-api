@@ -44,6 +44,8 @@ except ModuleNotFoundError:
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-5-mini"
 QUERY_CLASSIFIER_MODEL_DEFAULT = "gpt-5-mini"
+QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT = "gpt-5-nano"
+QUERY_CACHE_CLASSIFIER_TIMEOUT_MS_DEFAULT = 250
 MAX_SOURCES_SENT = 4
 MIN_SCORE_DEFAULT = 0.0
 DEBUG_TIMINGS = True
@@ -139,6 +141,14 @@ QUERY_CLASSIFIER_INSTRUCTIONS = (
     "Classify the user's restaurant query into exactly one category.\n"
     "Allowed labels: Operations, Dietary, Events, Menu, Transactions, Other .\n"
     "Return exactly one label and no other text."
+)
+
+QUERY_CACHE_CLASSIFIER_INSTRUCTIONS = (
+    "Decide whether this user message is a standalone, normal restaurant-related query that is safe to cache.\n"
+    "Return exactly one label: CACHEABLE or NOT_CACHEABLE.\n"
+    "Use CACHEABLE for direct restaurant questions (menu, hours, location, reservations, pricing, dietary, events, ordering).\n"
+    "Use NOT_CACHEABLE for non-restaurant topics, chit-chat, personal requests, abuse, or contextual follow-ups.\n"
+    "Return only the label."
 )
 
 QUERY_CACHE_NAMESPACE_DEFAULT = "qcache:v1"
@@ -819,7 +829,7 @@ def query_cache_eligibility(
     inferred_intent: Optional[str] = None,
     require_restaurant_relevance: bool = QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT,
 ) -> Tuple[bool, str]:
-    _ = session_state
+    _ = session_state, inferred_intent, require_restaurant_relevance
     if not (user_query or "").strip():
         return False, "empty_query"
     status = str(resolved_reference.get("status") or "")
@@ -827,8 +837,6 @@ def query_cache_eligibility(
         return False, f"reference_status_{status}"
     if _is_followup_reference_query(user_query):
         return False, "followup_reference_pattern"
-    if require_restaurant_relevance and not is_restaurant_relevant_query(user_query, inferred_intent):
-        return False, "non_restaurant_query"
     return True, "eligible"
 
 
@@ -1560,11 +1568,86 @@ def handle_chat_turn(
     query_cache_semantic_threshold: float = QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT,
     query_cache_semantic_max_candidates: int = QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT,
     query_cache_require_restaurant_relevance: bool = QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT,
+    query_cache_classifier_model: str = QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT,
+    query_cache_classifier_timeout_ms: int = QUERY_CACHE_CLASSIFIER_TIMEOUT_MS_DEFAULT,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     raw_query = (user_query or "").strip()
     exact_query = _exact_query_for_cache(raw_query)
     normalized_query = _normalize_query_for_cache(raw_query)
+    cache_classifier_model = (query_cache_classifier_model or QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT).strip()
+    if not cache_classifier_model:
+        cache_classifier_model = QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT
+    cache_classifier_timeout_ms = max(0, int(query_cache_classifier_timeout_ms))
+    cache_classifier_event: Optional[threading.Event] = None
+    cache_classifier_state: Dict[str, Any] = {
+        "status": "disabled",
+        "cacheable": None,
+        "raw_output": "",
+        "meta": {},
+        "error": None,
+    }
+    if query_cache is not None and raw_query:
+        cache_classifier_event = threading.Event()
+        cache_classifier_state["status"] = "pending"
+
+        def _cache_classifier_worker() -> None:
+            t0 = time.perf_counter()
+            log_event(
+                "query_cache_classification_start",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                model=cache_classifier_model,
+            )
+            try:
+                cacheable, raw_output, meta = classify_query_cacheability(client, cache_classifier_model, raw_query)
+                status = "ok" if cacheable is not None else "invalid_label"
+                cache_classifier_state.update(
+                    {
+                        "status": status,
+                        "cacheable": cacheable,
+                        "raw_output": raw_output,
+                        "meta": meta,
+                    }
+                )
+                if status == "ok":
+                    log_event(
+                        "query_cache_classification_complete",
+                        request_id=request_id,
+                        restaurant_id=restaurant_id,
+                        model=cache_classifier_model,
+                        cacheable=bool(cacheable),
+                        response_id=meta.get("response_id"),
+                        raw_output_len=meta.get("raw_output_len"),
+                        llm_latency_ms=meta.get("latency_ms"),
+                        latency_ms=int((time.perf_counter() - t0) * 1000),
+                    )
+                else:
+                    log_event(
+                        "query_cache_classification_failed",
+                        request_id=request_id,
+                        restaurant_id=restaurant_id,
+                        model=cache_classifier_model,
+                        reason="invalid_label",
+                        raw_output=(raw_output or "")[:200],
+                        response_id=meta.get("response_id"),
+                        llm_latency_ms=meta.get("latency_ms"),
+                        latency_ms=int((time.perf_counter() - t0) * 1000),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                cache_classifier_state.update({"status": "error", "error": str(exc)})
+                log_event(
+                    "query_cache_classification_failed",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    model=cache_classifier_model,
+                    error=str(exc),
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+            finally:
+                cache_classifier_event.set()
+
+        threading.Thread(target=_cache_classifier_worker, daemon=True).start()
     inferred_intent = infer_intent(raw_query)
     resolved_reference = resolve_reference(raw_query, session_state, store)
     reuse_session_context = should_reuse_session_context(raw_query, resolved_reference, inferred_intent)
@@ -1762,6 +1845,47 @@ def handle_chat_turn(
         nonlocal semantic_query_embedding
         if query_cache is None or not cache_eligible:
             return
+        if cache_classifier_event is None:
+            log_event(
+                "query_cache_store_skip",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+                reason="classifier_not_started",
+            )
+            return
+        if not cache_classifier_event.wait(cache_classifier_timeout_ms / 1000.0):
+            log_event(
+                "query_cache_store_skip",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+                reason="classifier_timeout",
+                model=cache_classifier_model,
+                timeout_ms=cache_classifier_timeout_ms,
+            )
+            return
+        classifier_status = str(cache_classifier_state.get("status") or "")
+        classifier_cacheable = cache_classifier_state.get("cacheable")
+        if classifier_status != "ok" or classifier_cacheable is not True:
+            reason = "classifier_not_cacheable"
+            if classifier_status == "invalid_label":
+                reason = "classifier_invalid_label"
+            elif classifier_status == "error":
+                reason = "classifier_error"
+            elif classifier_status != "ok":
+                reason = f"classifier_{classifier_status or 'unknown'}"
+            log_event(
+                "query_cache_store_skip",
+                request_id=request_id,
+                restaurant_id=restaurant_id,
+                key_prefix=cache_key_prefix,
+                reason=reason,
+                model=cache_classifier_model,
+                raw_output=(str(cache_classifier_state.get("raw_output") or "")[:200]),
+                error=cache_classifier_state.get("error"),
+            )
+            return
         if semantic_query_embedding is None:
             try:
                 semantic_query_embedding = embed_query(client, exact_query)[0].tolist()
@@ -1936,6 +2060,77 @@ def normalize_query_type_label(raw: str) -> Optional[str]:
     return None
 
 
+def normalize_query_cacheability_label(raw: str) -> Optional[bool]:
+    value = (raw or "").strip().strip("\"'`")
+    if not value:
+        return None
+
+    def _clean(s: str) -> str:
+        return re.sub(r"[^a-z]+", "", s.lower())
+
+    first_line = value.splitlines()[0].strip()
+    first_line_clean = _clean(first_line)
+    if first_line_clean == "cacheable":
+        return True
+    if first_line_clean == "notcacheable":
+        return False
+
+    lowered = value.lower()
+    if re.search(r"\bnot[\s_-]*cacheable\b", lowered):
+        return False
+    if re.search(r"\bcacheable\b", lowered):
+        return True
+    return None
+
+
+def classify_query_cacheability(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[bool], str, Dict[str, Any]]:
+    t0 = time.perf_counter()
+
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": QUERY_CACHE_CLASSIFIER_INSTRUCTIONS},
+            {"role": "user", "content": user_query},
+        ]
+    )
+
+    def _read(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def extract_chat_text(resp_obj: Any) -> str:
+        output_text = _read(resp_obj, "output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        parts: List[str] = []
+        output = _read(resp_obj, "output")
+        if isinstance(output, list):
+            for msg in output:
+                if _read(msg, "type") != "message":
+                    continue
+                content = _read(msg, "content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    text = _read(block, "text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+        return "\n".join(parts).strip()
+
+    raw = extract_chat_text(resp)
+    meta = {
+        "response_id": _read(resp, "id"),
+        "has_output_text": bool(raw),
+        "output_items_count": len(_read(resp, "output")) if isinstance(_read(resp, "output"), list) else None,
+        "raw_output_len": len(raw or ""),
+        "latency_ms": int((time.perf_counter() - t0) * 1000),
+    }
+
+    return normalize_query_cacheability_label(raw), raw, meta
+
+
 def classify_query_type(client: OpenAI, model: str, user_query: str) -> Tuple[Optional[str], str, Dict[str, Any]]:
     t0 = time.perf_counter()
 
@@ -2103,6 +2298,8 @@ class ChatHandler(BaseHTTPRequestHandler):
     query_cache_semantic_threshold: float = QUERY_CACHE_SEMANTIC_THRESHOLD_DEFAULT
     query_cache_semantic_max_candidates: int = QUERY_CACHE_SEMANTIC_MAX_CANDIDATES_DEFAULT
     query_cache_require_restaurant_relevance: bool = QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT
+    query_cache_classifier_model: str = QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT
+    query_cache_classifier_timeout_ms: int = QUERY_CACHE_CLASSIFIER_TIMEOUT_MS_DEFAULT
     widget_signing_keys: Dict[str, bytes] = {}
     widget_active_kid: str = "v1"
     default_ip_max_requests: int = 30
@@ -2708,6 +2905,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 query_cache_semantic_threshold=self.query_cache_semantic_threshold,
                 query_cache_semantic_max_candidates=self.query_cache_semantic_max_candidates,
                 query_cache_require_restaurant_relevance=self.query_cache_require_restaurant_relevance,
+                query_cache_classifier_model=self.query_cache_classifier_model,
+                query_cache_classifier_timeout_ms=self.query_cache_classifier_timeout_ms,
                 request_id=request_id,
             )
             assistant_text = (turn.get("assistant_text") or "").strip()
@@ -2888,6 +3087,15 @@ def serve(top_k: int = 8, port: int = 8000):
         "QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE",
         QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE_DEFAULT,
     )
+    query_cache_classifier_model = (
+        os.getenv("QUERY_CACHE_CLASSIFIER_MODEL") or QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT
+    ).strip()
+    if not query_cache_classifier_model:
+        query_cache_classifier_model = QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT
+    query_cache_classifier_timeout_ms = int(
+        os.getenv("QUERY_CACHE_CLASSIFIER_TIMEOUT_MS", str(QUERY_CACHE_CLASSIFIER_TIMEOUT_MS_DEFAULT))
+    )
+    query_cache_classifier_timeout_ms = max(0, query_cache_classifier_timeout_ms)
     query_cache_namespace = (os.getenv("QUERY_CACHE_NAMESPACE") or QUERY_CACHE_NAMESPACE_DEFAULT).strip()
     if not query_cache_namespace:
         query_cache_namespace = QUERY_CACHE_NAMESPACE_DEFAULT
@@ -2939,6 +3147,8 @@ def serve(top_k: int = 8, port: int = 8000):
     ChatHandler.query_cache_semantic_threshold = query_cache_semantic_threshold
     ChatHandler.query_cache_semantic_max_candidates = query_cache_semantic_max_candidates
     ChatHandler.query_cache_require_restaurant_relevance = query_cache_require_restaurant_relevance
+    ChatHandler.query_cache_classifier_model = query_cache_classifier_model
+    ChatHandler.query_cache_classifier_timeout_ms = query_cache_classifier_timeout_ms
     ChatHandler.widget_signing_keys = widget_signing_keys
     ChatHandler.widget_active_kid = widget_active_kid
     ChatHandler.default_ip_max_requests = rate_limit_rpm
@@ -2975,7 +3185,9 @@ def serve(top_k: int = 8, port: int = 8000):
             f"(redis, ttl={query_cache_ttl_seconds}s, namespace={query_cache_namespace}, "
             f"semantic_threshold={query_cache_semantic_threshold}, "
             f"semantic_max_candidates={query_cache_semantic_max_candidates}, "
-            f"require_restaurant_relevance={'yes' if query_cache_require_restaurant_relevance else 'no'})"
+            f"require_restaurant_relevance={'yes' if query_cache_require_restaurant_relevance else 'no'}, "
+            f"classifier_model={query_cache_classifier_model}, "
+            f"classifier_timeout_ms={query_cache_classifier_timeout_ms})"
         )
     else:
         print("   - Query cache: disabled")
