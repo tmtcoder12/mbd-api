@@ -2,3 +2,4 @@ openai
 numpy
 python-dotenv
 redis
+stripe

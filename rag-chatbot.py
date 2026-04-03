@@ -35,6 +35,14 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from supabase_store import SupabaseStore, SupabaseStoreError
+from stripe_billing import (
+    StripeConfigError,
+    StripeSdkError,
+    StripeWebhookSignatureError,
+    ensure_stripe_configured,
+    ensure_stripe_sdk_available,
+    process_stripe_webhook,
+)
 try:
     import redis
 except ModuleNotFoundError:
@@ -2310,6 +2318,8 @@ class ChatHandler(BaseHTTPRequestHandler):
     default_token_issue_window_seconds: int = 60
     default_token_max_age_seconds: int = 900
     query_classifier_model: str = QUERY_CLASSIFIER_MODEL_DEFAULT
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
     _cors_origin: Optional[str] = None
 
     def end_headers(self):
@@ -2390,6 +2400,25 @@ class ChatHandler(BaseHTTPRequestHandler):
             "accept_language": self.headers.get("Accept-Language", ""),
         }
 
+    def _insert_audit_event_safe(
+        self,
+        event_type: str,
+        restaurant_id: Optional[str] = None,
+        actor: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.insert_audit_event(
+                event_type,
+                restaurant_id=restaurant_id,
+                actor=actor,
+                details=details,
+            )
+        except SupabaseStoreError:
+            pass
+
     def _source_refs(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         refs = []
         for row in results[:MAX_SOURCES_SENT]:
@@ -2404,7 +2433,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             )
         return refs
 
-    def _load_security_settings(
+    def _load_restaurant_access_settings(
         self,
         restaurant_id: str,
         request_id: str,
@@ -2419,10 +2448,20 @@ class ChatHandler(BaseHTTPRequestHandler):
             "token_issue_window_seconds": self.default_token_issue_window_seconds,
         }
         if self.store is None:
-            return settings
+            self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
+            return None
         try:
             if not self.store.restaurant_exists(restaurant_id):
                 self._send_json_error(400, "restaurantId does not exist", request_id=request_id)
+                return None
+            if not self.store.restaurant_has_active_subscription(restaurant_id):
+                self._insert_audit_event_safe(
+                    "subscription_inactive_block",
+                    restaurant_id=restaurant_id,
+                    actor="chat_api",
+                    details={"request_id": request_id},
+                )
+                self._send_json_error(403, "Restaurant subscription is inactive", request_id=request_id)
                 return None
             loaded = self.store.get_restaurant_security_settings(restaurant_id)
             settings.update(loaded)
@@ -2647,6 +2686,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         request_id = str(uuid.uuid4())
         start = time.perf_counter()
         parsed = urlparse(self.path).path
+        if parsed == "/api/stripe/webhook":
+            self._handle_stripe_webhook(request_id, start)
+            return
         if parsed == "/api/chat-stream":
             self._handle_chat_stream(request_id, start)
             return
@@ -2654,6 +2696,106 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._handle_widget_token(request_id, start)
             return
         self._send_json_error(404, "Not found", request_id=request_id)
+
+    def _handle_stripe_webhook(self, request_id: str, start: float):
+        if self.store is None:
+            self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json_error(400, "Invalid Content-Length header", request_id=request_id)
+            return
+        raw_body = self.rfile.read(length) if length > 0 else b""
+        signature_header = (self.headers.get("Stripe-Signature") or "").strip()
+
+        try:
+            result = process_stripe_webhook(
+                raw_body=raw_body,
+                signature_header=signature_header,
+                webhook_secret=self.stripe_webhook_secret,
+                stripe_secret_key=self.stripe_secret_key,
+                store=self.store,
+            )
+        except StripeWebhookSignatureError as exc:
+            self._insert_audit_event_safe(
+                "stripe_webhook_failed",
+                actor="chat_api",
+                details={
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "latency_ms": int((time.perf_counter() - start) * 1000),
+                },
+            )
+            self._send_json_error(400, str(exc), request_id=request_id)
+            return
+        except (StripeConfigError, StripeSdkError) as exc:
+            self._insert_audit_event_safe(
+                "stripe_webhook_failed",
+                actor="chat_api",
+                details={
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "latency_ms": int((time.perf_counter() - start) * 1000),
+                },
+            )
+            self._send_json_error(500, str(exc), request_id=request_id)
+            return
+        except SupabaseStoreError as exc:
+            self._insert_audit_event_safe(
+                "stripe_webhook_failed",
+                actor="chat_api",
+                details={
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "latency_ms": int((time.perf_counter() - start) * 1000),
+                },
+            )
+            self._send_json_error(502, f"Failed to persist Stripe webhook: {exc}", request_id=request_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._insert_audit_event_safe(
+                "stripe_webhook_failed",
+                actor="chat_api",
+                details={
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "latency_ms": int((time.perf_counter() - start) * 1000),
+                },
+            )
+            self._send_json_error(500, f"Unhandled Stripe webhook error: {exc}", request_id=request_id)
+            return
+
+        audit_event_type = "stripe_webhook_processed" if result.ok else "stripe_webhook_failed"
+        self._insert_audit_event_safe(
+            audit_event_type,
+            restaurant_id=result.restaurant_id,
+            actor="chat_api",
+            details={
+                "request_id": request_id,
+                "event_id": result.event_id,
+                "event_type": result.event_type,
+                "duplicate": result.duplicate,
+                "message": result.message,
+                "processing_status": result.processing_status,
+                "latency_ms": int((time.perf_counter() - start) * 1000),
+            },
+        )
+
+        response = {
+            "ok": result.ok,
+            "message": result.message,
+            "eventId": result.event_id,
+            "eventType": result.event_type,
+        }
+        data = json.dumps(response, ensure_ascii=False).encode("utf-8")
+        self.send_response(result.status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Request-Id", request_id)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_widget_token(self, request_id: str, start: float):
         origin = self._normalize_origin(self.headers.get("Origin", ""))
@@ -2682,7 +2824,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc), request_id=request_id)
             return
 
-        security_settings = self._load_security_settings(restaurant_id, request_id)
+        security_settings = self._load_restaurant_access_settings(restaurant_id, request_id)
         if security_settings is None:
             return
         if not self._origin_guard(restaurant_id, origin, request_id):
@@ -2775,7 +2917,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc), request_id=request_id)
             return
 
-        security_settings = self._load_security_settings(restaurant_id, request_id)
+        security_settings = self._load_restaurant_access_settings(restaurant_id, request_id)
         if security_settings is None:
             return
         if not self._origin_guard(restaurant_id, origin, request_id):
@@ -3099,6 +3241,8 @@ def serve(top_k: int = 8, port: int = 8000):
     query_cache_namespace = (os.getenv("QUERY_CACHE_NAMESPACE") or QUERY_CACHE_NAMESPACE_DEFAULT).strip()
     if not query_cache_namespace:
         query_cache_namespace = QUERY_CACHE_NAMESPACE_DEFAULT
+    stripe_secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
+    stripe_webhook_secret = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
     signing_keys_raw = os.getenv("WIDGET_SIGNING_KEYS", "").strip()
     widget_active_kid = (os.getenv("WIDGET_ACTIVE_KID") or "v1").strip()
     query_classifier_model = (os.getenv("QUERY_CLASSIFIER_MODEL") or QUERY_CLASSIFIER_MODEL_DEFAULT).strip()
@@ -3111,6 +3255,11 @@ def serve(top_k: int = 8, port: int = 8000):
         raise SystemExit("WIDGET_SIGNING_KEYS must be configured for production token verification")
     if widget_active_kid not in widget_signing_keys:
         raise SystemExit("WIDGET_ACTIVE_KID must reference a key present in WIDGET_SIGNING_KEYS")
+    try:
+        ensure_stripe_configured(stripe_secret_key, stripe_webhook_secret)
+        ensure_stripe_sdk_available()
+    except (StripeConfigError, StripeSdkError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     store = make_supabase_store_if_configured()
 
@@ -3159,6 +3308,8 @@ def serve(top_k: int = 8, port: int = 8000):
     ChatHandler.default_token_issue_window_seconds = token_issue_rate_limit_window_s
     ChatHandler.default_token_max_age_seconds = token_max_age_s
     ChatHandler.query_classifier_model = query_classifier_model
+    ChatHandler.stripe_secret_key = stripe_secret_key
+    ChatHandler.stripe_webhook_secret = stripe_webhook_secret
 
     server = ThreadingHTTPServer(("0.0.0.0", port), ChatHandler)
     print(f"✅ Chat server running at http://localhost:{port}")
@@ -3166,6 +3317,7 @@ def serve(top_k: int = 8, port: int = 8000):
     print(f"   - Chat persistence: {'enabled' if persist_chat else 'disabled'}")
     print("   - Stream API: POST /api/chat-stream")
     print("   - Token API: POST /api/widget-token")
+    print("   - Stripe API: POST /api/stripe/webhook")
     print("   - Health API: GET /healthz")
     print(
         f"   - Rate limit: {rate_limit_rpm} requests / {rate_limit_window_s}s per (restaurant_id, client_ip)"
@@ -3194,6 +3346,7 @@ def serve(top_k: int = 8, port: int = 8000):
     print(f"   - Signing keys loaded: {len(widget_signing_keys)}")
     print(f"   - Active widget key id: {widget_active_kid}")
     print(f"   - Query classifier model: {query_classifier_model}")
+    print("   - Stripe billing: enabled")
     server.serve_forever()
 
 

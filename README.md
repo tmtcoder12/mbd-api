@@ -7,6 +7,7 @@ It serves a restaurant-focused RAG chatbot over HTTP with:
 - signed widget token issuance + verification
 - origin allowlist enforcement
 - per-IP and per-session rate limiting
+- Stripe-backed subscription gating for restaurant access
 - optional Supabase-backed chat persistence + retrieval
 
 ## Project Files
@@ -21,13 +22,14 @@ It serves a restaurant-focused RAG chatbot over HTTP with:
 The server is built on Python’s `ThreadingHTTPServer` and exposes:
 
 - `GET /healthz`
+- `POST /api/stripe/webhook`
 - `POST /api/widget-token`
 - `POST /api/chat-stream`
 
 High-level request flow:
 
 1. Validate request body and headers (`Origin`, required fields).
-2. Validate `restaurantId`, load restaurant security settings from Supabase.
+2. Validate `restaurantId`, confirm the restaurant has an active Stripe subscription, and load restaurant security settings from Supabase.
 3. Enforce origin allowlist for that restaurant.
 4. Enforce rate limits (token issuance, IP, session).
 5. For chat: verify `widgetToken` (HS256, `kid`, `rid`, `orig`, `exp`).
@@ -75,6 +77,31 @@ Success response:
 }
 ```
 
+Requests are rejected with `403` when the restaurant does not have an active Stripe subscription in Supabase.
+
+### `POST /api/stripe/webhook`
+
+Receives Stripe webhook events for subscription lifecycle updates.
+
+Supported event types:
+
+- `checkout.session.completed`
+- `customer.subscription.created`
+- `customer.subscription.updated`
+- `customer.subscription.deleted`
+
+Requirements:
+
+- `Stripe-Signature` header
+- raw request body exactly as sent by Stripe
+
+Integration contract:
+
+- Stripe Payment Link URLs must be distributed with `client_reference_id=<restaurant_uuid>` appended
+- `checkout.session.completed` uses that `client_reference_id` to map the Stripe checkout back to `public.restaurants.id`
+
+The webhook persists Stripe identifiers and subscription status into Supabase so only restaurants with an `active` subscription can access chat endpoints.
+
 ### `POST /api/chat-stream`
 
 Streams chatbot output as `application/x-ndjson` with `Transfer-Encoding: chunked`.
@@ -110,6 +137,8 @@ Streaming event types:
 ### Required
 
 - `OPENAI_API_KEY`
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
 - `WIDGET_SIGNING_KEYS`  
   Format: JSON object (`{"v1":"secret1","v2":"secret2"}`) or CSV (`v1:secret1,v2:secret2`)
 - `WIDGET_ACTIVE_KID` (must exist in `WIDGET_SIGNING_KEYS`)
@@ -171,7 +200,10 @@ Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.
 `supabase_store.py` calls PostgREST and RPC endpoints for:
 
 - origin + restaurant validation
+- active subscription validation
 - security settings lookup
+- Stripe subscription upsert + lookup
+- Stripe webhook idempotency logging
 - audit events
 - session upsert
 - session state persistence (`chat_session_state`)
@@ -183,12 +215,16 @@ Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.
 Expected backend tables/RPC include (at minimum):
 
 - `restaurants`
+- `restaurant_subscriptions`
 - `restaurant_allowed_origins`
 - `restaurant_security_settings`
+- `stripe_webhook_events`
 - `audit_events`
 - `chat_sessions`
 - `chat_session_state`
 - `chat_messages`
+- SQL function: `restaurant_has_active_subscription`
+- SQL function: `user_can_access_active_restaurant`
 - RPC: `upsert_session`, `match_chunks`
 
 ## Migrations
@@ -196,6 +232,7 @@ Expected backend tables/RPC include (at minimum):
 Apply migrations:
 
 ```bash
+psql "$DATABASE_URL" -f supabase/migrations/20260402_stripe_subscriptions.sql
 psql "$DATABASE_URL" -f migrations/20260317_chat_session_state.sql
 psql "$DATABASE_URL" -f migrations/20260328_chat_session_language.sql
 ```

@@ -82,6 +82,13 @@ class SupabaseStore:
         except ValueError as exc:
             raise SupabaseStoreError(f"{field_name} must be a valid UUID") from exc
 
+    @staticmethod
+    def _normalize_optional_text(value: Optional[Any]) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
     def upsert_restaurant(self, restaurant_id: str, slug: Optional[str] = None, name: Optional[str] = None) -> str:
         rid = self._require_uuid(restaurant_id, "restaurant_id")
         payload = {
@@ -113,6 +120,187 @@ class SupabaseStore:
             query={"select": "id", "id": f"eq.{rid}", "limit": "1"},
         )
         return isinstance(data, list) and len(data) > 0
+
+    def restaurant_has_active_subscription(self, restaurant_id: str) -> bool:
+        rid = self._require_uuid(restaurant_id, "restaurant_id")
+        data = self._request(
+            "GET",
+            "/rest/v1/restaurant_subscriptions",
+            query={
+                "select": "restaurant_id",
+                "restaurant_id": f"eq.{rid}",
+                "stripe_subscription_status": "eq.active",
+                "limit": "1",
+            },
+        )
+        return isinstance(data, list) and len(data) > 0
+
+    def get_restaurant_subscription_by_subscription_id(self, stripe_subscription_id: str) -> Optional[Dict[str, Any]]:
+        subscription_id = self._normalize_optional_text(stripe_subscription_id)
+        if not subscription_id:
+            raise SupabaseStoreError("stripe_subscription_id is required")
+        data = self._request(
+            "GET",
+            "/rest/v1/restaurant_subscriptions",
+            query={
+                "select": (
+                    "restaurant_id,stripe_customer_id,stripe_subscription_id,stripe_payment_link_id,"
+                    "stripe_checkout_session_id,client_reference_id,stripe_price_id,stripe_product_id,"
+                    "stripe_subscription_status,current_period_start,current_period_end,cancel_at,"
+                    "canceled_at,ended_at,last_checkout_completed_at,last_synced_at,created_at,updated_at"
+                ),
+                "stripe_subscription_id": f"eq.{subscription_id}",
+                "limit": "1",
+            },
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def get_restaurant_subscription_by_customer_id(self, stripe_customer_id: str) -> Optional[Dict[str, Any]]:
+        customer_id = self._normalize_optional_text(stripe_customer_id)
+        if not customer_id:
+            raise SupabaseStoreError("stripe_customer_id is required")
+        data = self._request(
+            "GET",
+            "/rest/v1/restaurant_subscriptions",
+            query={
+                "select": (
+                    "restaurant_id,stripe_customer_id,stripe_subscription_id,stripe_payment_link_id,"
+                    "stripe_checkout_session_id,client_reference_id,stripe_price_id,stripe_product_id,"
+                    "stripe_subscription_status,current_period_start,current_period_end,cancel_at,"
+                    "canceled_at,ended_at,last_checkout_completed_at,last_synced_at,created_at,updated_at"
+                ),
+                "stripe_customer_id": f"eq.{customer_id}",
+                "limit": "1",
+            },
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def upsert_restaurant_subscription(self, restaurant_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        rid = self._require_uuid(restaurant_id, "restaurant_id")
+        payload = {
+            "restaurant_id": rid,
+            "stripe_customer_id": self._normalize_optional_text(fields.get("stripe_customer_id")),
+            "stripe_subscription_id": self._normalize_optional_text(fields.get("stripe_subscription_id")),
+            "stripe_payment_link_id": self._normalize_optional_text(fields.get("stripe_payment_link_id")),
+            "stripe_checkout_session_id": self._normalize_optional_text(fields.get("stripe_checkout_session_id")),
+            "client_reference_id": self._normalize_optional_text(fields.get("client_reference_id")),
+            "stripe_price_id": self._normalize_optional_text(fields.get("stripe_price_id")),
+            "stripe_product_id": self._normalize_optional_text(fields.get("stripe_product_id")),
+            "stripe_subscription_status": self._normalize_optional_text(fields.get("stripe_subscription_status")),
+            "current_period_start": fields.get("current_period_start"),
+            "current_period_end": fields.get("current_period_end"),
+            "cancel_at": fields.get("cancel_at"),
+            "canceled_at": fields.get("canceled_at"),
+            "ended_at": fields.get("ended_at"),
+            "last_checkout_completed_at": fields.get("last_checkout_completed_at"),
+            "last_synced_at": fields.get("last_synced_at") or datetime.now(timezone.utc).isoformat(),
+            "updated_at": fields.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+        }
+        if not payload["stripe_subscription_status"]:
+            raise SupabaseStoreError("stripe_subscription_status is required")
+        data = self._request(
+            "POST",
+            "/rest/v1/restaurant_subscriptions",
+            payload=[payload],
+            query={"on_conflict": "restaurant_id"},
+            prefer="resolution=merge-duplicates,return=representation",
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        if isinstance(data, dict):
+            return data
+        raise SupabaseStoreError("upsert_restaurant_subscription did not return row data")
+
+    def get_stripe_webhook_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        normalized_event_id = self._normalize_optional_text(event_id)
+        if not normalized_event_id:
+            raise SupabaseStoreError("event_id is required")
+        data = self._request(
+            "GET",
+            "/rest/v1/stripe_webhook_events",
+            query={
+                "select": (
+                    "event_id,event_type,stripe_created_at,restaurant_id,stripe_customer_id,"
+                    "stripe_subscription_id,processing_status,payload,error_message,processed_at,created_at"
+                ),
+                "event_id": f"eq.{normalized_event_id}",
+                "limit": "1",
+            },
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def create_stripe_webhook_event(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        event_id = self._normalize_optional_text(fields.get("event_id"))
+        event_type = self._normalize_optional_text(fields.get("event_type"))
+        if not event_id:
+            raise SupabaseStoreError("event_id is required")
+        if not event_type:
+            raise SupabaseStoreError("event_type is required")
+        restaurant_id = fields.get("restaurant_id")
+        payload = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "stripe_created_at": fields.get("stripe_created_at"),
+            "restaurant_id": self._require_uuid(restaurant_id, "restaurant_id") if restaurant_id else None,
+            "stripe_customer_id": self._normalize_optional_text(fields.get("stripe_customer_id")),
+            "stripe_subscription_id": self._normalize_optional_text(fields.get("stripe_subscription_id")),
+            "processing_status": self._normalize_optional_text(fields.get("processing_status")) or "received",
+            "payload": fields.get("payload") or {},
+            "error_message": self._normalize_optional_text(fields.get("error_message")),
+            "processed_at": fields.get("processed_at"),
+        }
+        data = self._request(
+            "POST",
+            "/rest/v1/stripe_webhook_events",
+            payload=[payload],
+            prefer="return=representation",
+        )
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+        if isinstance(data, dict):
+            return data
+        raise SupabaseStoreError("create_stripe_webhook_event did not return row data")
+
+    def update_stripe_webhook_event(self, event_id: str, fields: Dict[str, Any]) -> None:
+        normalized_event_id = self._normalize_optional_text(event_id)
+        if not normalized_event_id:
+            raise SupabaseStoreError("event_id is required")
+        payload = dict(fields)
+        if "restaurant_id" in payload and payload["restaurant_id"]:
+            payload["restaurant_id"] = self._require_uuid(str(payload["restaurant_id"]), "restaurant_id")
+        if "event_type" in payload:
+            payload["event_type"] = self._normalize_optional_text(payload.get("event_type"))
+        if "stripe_customer_id" in payload:
+            payload["stripe_customer_id"] = self._normalize_optional_text(payload.get("stripe_customer_id"))
+        if "stripe_subscription_id" in payload:
+            payload["stripe_subscription_id"] = self._normalize_optional_text(payload.get("stripe_subscription_id"))
+        if "processing_status" in payload:
+            payload["processing_status"] = self._normalize_optional_text(payload.get("processing_status"))
+        if "error_message" in payload:
+            payload["error_message"] = self._normalize_optional_text(payload.get("error_message"))
+        self._request(
+            "PATCH",
+            "/rest/v1/stripe_webhook_events",
+            payload=payload,
+            query={"event_id": f"eq.{normalized_event_id}"},
+            prefer="return=minimal",
+        )
 
     def get_restaurant_system_prompt(self, restaurant_id: str) -> Optional[str]:
         rid = self._require_uuid(restaurant_id, "restaurant_id")
@@ -162,7 +350,10 @@ class SupabaseStore:
             "GET",
             "/rest/v1/restaurant_security_settings",
             query={
-                "select": "ip_max_requests,ip_window_seconds,session_max_requests,session_window_seconds,token_max_age_seconds",
+                "select": (
+                    "ip_max_requests,ip_window_seconds,session_max_requests,session_window_seconds,"
+                    "token_max_age_seconds,token_issue_max_requests,token_issue_window_seconds"
+                ),
                 "restaurant_id": f"eq.{rid}",
                 "limit": "1",
             },
