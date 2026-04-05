@@ -124,16 +124,37 @@ class SupabaseStore:
     def restaurant_has_active_subscription(self, restaurant_id: str) -> bool:
         rid = self._require_uuid(restaurant_id, "restaurant_id")
         data = self._request(
-            "GET",
-            "/rest/v1/restaurant_subscriptions",
-            query={
-                "select": "restaurant_id",
-                "restaurant_id": f"eq.{rid}",
-                "stripe_subscription_status": "eq.active",
-                "limit": "1",
-            },
+            "POST",
+            "/rest/v1/rpc/restaurant_has_active_subscription",
+            payload={"p_restaurant_id": rid},
         )
-        return isinstance(data, list) and len(data) > 0
+        if isinstance(data, bool):
+            return data
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, bool):
+                return row
+            if isinstance(row, dict):
+                value = row.get("restaurant_has_active_subscription")
+                if isinstance(value, bool):
+                    return value
+                if len(row) == 1:
+                    only_value = next(iter(row.values()))
+                    if isinstance(only_value, bool):
+                        return only_value
+        if isinstance(data, dict):
+            value = data.get("restaurant_has_active_subscription")
+            if isinstance(value, bool):
+                return value
+            if len(data) == 1:
+                only_value = next(iter(data.values()))
+                if isinstance(only_value, bool):
+                    return only_value
+        if isinstance(data, str):
+            normalized = data.strip().lower()
+            if normalized in {"true", "false"}:
+                return normalized == "true"
+        raise SupabaseStoreError("restaurant_has_active_subscription returned an invalid payload")
 
     def get_restaurant_subscription_by_subscription_id(self, stripe_subscription_id: str) -> Optional[Dict[str, Any]]:
         subscription_id = self._normalize_optional_text(stripe_subscription_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import uuid
@@ -145,6 +146,7 @@ def normalize_subscription_snapshot(
     stripe_payment_link_id: Optional[str] = None,
     client_reference_id: Optional[str] = None,
     last_checkout_completed_at: Optional[str] = None,
+    existing_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     restaurant_uuid = _require_uuid_text(restaurant_id, "restaurant_id")
     if not isinstance(subscription, dict):
@@ -172,6 +174,30 @@ def normalize_subscription_snapshot(
     else:
         product_id = _coerce_text(product)
 
+    current_period_start = _first_present_timestamp(
+        subscription.get("current_period_start"),
+        _subscription_items_period_timestamp(subscription, "current_period_start", prefer="min"),
+        _snapshot_field(existing_snapshot, "current_period_start"),
+    )
+    current_period_end = _first_present_timestamp(
+        subscription.get("current_period_end"),
+        _subscription_items_period_timestamp(subscription, "current_period_end", prefer="max"),
+        _snapshot_field(existing_snapshot, "current_period_end"),
+    )
+    cancel_at = _first_present_timestamp(
+        subscription.get("cancel_at"),
+        current_period_end if bool(subscription.get("cancel_at_period_end")) else None,
+        _snapshot_field(existing_snapshot, "cancel_at"),
+    )
+    canceled_at = _first_present_timestamp(
+        subscription.get("canceled_at"),
+        _snapshot_field(existing_snapshot, "canceled_at"),
+    )
+    ended_at = _first_present_timestamp(
+        subscription.get("ended_at"),
+        _snapshot_field(existing_snapshot, "ended_at"),
+    )
+
     snapshot = {
         "restaurant_id": restaurant_uuid,
         "stripe_customer_id": _coerce_identifier(subscription.get("customer")) or _coerce_text(stripe_customer_id),
@@ -182,12 +208,15 @@ def normalize_subscription_snapshot(
         "stripe_price_id": _coerce_text(price.get("id")),
         "stripe_product_id": product_id,
         "stripe_subscription_status": status,
-        "current_period_start": _timestamp_to_iso(subscription.get("current_period_start")),
-        "current_period_end": _timestamp_to_iso(subscription.get("current_period_end")),
-        "cancel_at": _timestamp_to_iso(subscription.get("cancel_at")),
-        "canceled_at": _timestamp_to_iso(subscription.get("canceled_at")),
-        "ended_at": _timestamp_to_iso(subscription.get("ended_at")),
-        "last_checkout_completed_at": _timestamp_to_iso(last_checkout_completed_at),
+        "current_period_start": current_period_start,
+        "current_period_end": current_period_end,
+        "cancel_at": cancel_at,
+        "canceled_at": canceled_at,
+        "ended_at": ended_at,
+        "last_checkout_completed_at": _first_present_timestamp(
+            last_checkout_completed_at,
+            _snapshot_field(existing_snapshot, "last_checkout_completed_at"),
+        ),
         "last_synced_at": _utcnow_iso(),
     }
     return snapshot
@@ -231,7 +260,7 @@ def process_stripe_webhook(
         "stripe_customer_id": identifiers.get("stripe_customer_id"),
         "stripe_subscription_id": identifiers.get("stripe_subscription_id"),
         "processing_status": "received",
-        "payload": event,
+        "payload": _to_json_safe(event),
         "error_message": None,
         "processed_at": None,
     }
@@ -371,6 +400,7 @@ def _handle_checkout_session_completed(
         stripe_payment_link_id=payment_link_id,
         client_reference_id=client_reference_id,
         last_checkout_completed_at=_timestamp_to_iso(session.get("created")) or _utcnow_iso(),
+        existing_snapshot=store.get_restaurant_subscription_by_subscription_id(subscription_id),
     )
     row = store.upsert_restaurant_subscription(restaurant_id, snapshot)
     return {
@@ -414,6 +444,7 @@ def _handle_subscription_event(
         stripe_payment_link_id=_coerce_text(existing.get("stripe_payment_link_id")),
         client_reference_id=_coerce_text(existing.get("client_reference_id")),
         last_checkout_completed_at=_coerce_text(existing.get("last_checkout_completed_at")),
+        existing_snapshot=existing,
     )
     row = store.upsert_restaurant_subscription(restaurant_id, snapshot)
     return {
@@ -487,6 +518,11 @@ def _timestamp_to_iso(value: Any) -> Optional[str]:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).isoformat()
+    if isinstance(value, Decimal):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+        except Exception:  # noqa: BLE001
+            return str(value)
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
     text = _coerce_text(value)
@@ -547,3 +583,103 @@ def _to_plain_dict(value: Any) -> Any:
         if public_fields:
             return public_fields
     return value
+
+
+def _to_json_safe(value: Any) -> Any:
+    normalized = _to_plain_dict(value)
+    if isinstance(normalized, datetime):
+        return normalized.astimezone(timezone.utc).isoformat() if normalized.tzinfo else normalized.replace(tzinfo=timezone.utc).isoformat()
+    if isinstance(normalized, Decimal):
+        return str(normalized)
+    if isinstance(normalized, Mapping):
+        return {str(k): _to_json_safe(v) for k, v in normalized.items()}
+    if isinstance(normalized, list):
+        return [_to_json_safe(item) for item in normalized]
+    if isinstance(normalized, tuple):
+        return [_to_json_safe(item) for item in normalized]
+    if isinstance(normalized, set):
+        return [_to_json_safe(item) for item in normalized]
+    return normalized
+
+
+def subscription_allows_api_access(
+    *,
+    status: Optional[str],
+    current_period_end: Optional[str],
+    ended_at: Optional[str],
+    now: Optional[datetime] = None,
+) -> bool:
+    normalized_status = _coerce_text(status)
+    if normalized_status == "active":
+        return True
+
+    reference = now or datetime.now(timezone.utc)
+    period_end_dt = _parse_timestamp(current_period_end)
+    ended_at_dt = _parse_timestamp(ended_at)
+    if period_end_dt is None or period_end_dt <= reference:
+        return False
+    if ended_at_dt is not None and ended_at_dt <= reference:
+        return False
+    return True
+
+
+def _subscription_items_period_timestamp(subscription: Dict[str, Any], field_name: str, prefer: str) -> Optional[str]:
+    items = subscription.get("items") or {}
+    item_rows = items.get("data") if isinstance(items, dict) else None
+    if not isinstance(item_rows, list):
+        return None
+
+    timestamps = []
+    for item in item_rows:
+        if not isinstance(item, dict):
+            continue
+        candidate = _parse_timestamp(item.get(field_name))
+        if candidate is not None:
+            timestamps.append(candidate)
+    if not timestamps:
+        return None
+    selected = min(timestamps) if prefer == "min" else max(timestamps)
+    return selected.astimezone(timezone.utc).isoformat()
+
+
+def _first_present_timestamp(*values: Any) -> Optional[str]:
+    for value in values:
+        normalized = _timestamp_to_iso(value)
+        if normalized:
+            return normalized
+    return None
+
+
+def _snapshot_field(snapshot: Optional[Dict[str, Any]], field_name: str) -> Any:
+    if isinstance(snapshot, dict):
+        return snapshot.get(field_name)
+    return None
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    if isinstance(value, Decimal):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
