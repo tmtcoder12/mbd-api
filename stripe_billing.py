@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -520,10 +521,29 @@ def _to_plain_dict(value: Any) -> Any:
         return None
     if hasattr(value, "to_dict_recursive"):
         return _to_plain_dict(value.to_dict_recursive())
-    if isinstance(value, dict):
+    if hasattr(value, "to_dict"):
+        try:
+            return _to_plain_dict(value.to_dict())
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(value, Mapping):
         return {str(k): _to_plain_dict(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_to_plain_dict(item) for item in value]
     if isinstance(value, tuple):
         return [_to_plain_dict(item) for item in value]
+    try:
+        as_dict = dict(value)
+    except Exception:  # noqa: BLE001
+        as_dict = None
+    if isinstance(as_dict, dict):
+        return {str(k): _to_plain_dict(v) for k, v in as_dict.items()}
+    if hasattr(value, "__dict__"):
+        public_fields = {
+            str(k): _to_plain_dict(v)
+            for k, v in vars(value).items()
+            if not str(k).startswith("_")
+        }
+        if public_fields:
+            return public_fields
     return value
