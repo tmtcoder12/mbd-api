@@ -582,15 +582,19 @@ class SupabaseStore:
         if not normalized:
             return []
         in_expr = "(" + ",".join(f'"{cid}"' for cid in normalized) + ")"
-        data = self._request(
-            "GET",
-            "/rest/v1/knowledge_chunks",
-            query={
-                "select": "id,title,text,type,source_url,page_path,image_url,extra_metadata",
-                "id": f"in.{in_expr}",
-                "limit": str(len(normalized)),
-            },
-        )
+        query = {
+            "select": "id,title,text,type,source_url,page_path,image_url,extra_metadata",
+            "id": f"in.{in_expr}",
+            "limit": str(len(normalized)),
+        }
+        try:
+            data = self._request("GET", "/rest/v1/knowledge_chunks", query=query)
+        except SupabaseStoreError as exc:
+            if "image_url" not in str(exc):
+                raise
+            fallback_query = dict(query)
+            fallback_query["select"] = "id,title,text,type,source_url,page_path,extra_metadata"
+            data = self._request("GET", "/rest/v1/knowledge_chunks", query=fallback_query)
         if isinstance(data, list):
             return data
         raise SupabaseStoreError("get_knowledge_chunks_by_ids returned non-list payload")

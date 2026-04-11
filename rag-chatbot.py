@@ -1042,9 +1042,36 @@ def _normalize_extra_metadata_key(key: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(key or "").strip().lower()).strip("_")
 
 
-def _item_name_from_extra_metadata(row: Dict[str, Any]) -> str:
-    meta = row.get("extra_metadata")
+def _coerce_extra_metadata(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _metadata_image_url(meta: Dict[str, Any]) -> str:
     if not isinstance(meta, dict):
+        return ""
+    for key, value in meta.items():
+        if _normalize_extra_metadata_key(key) == "image_url":
+            url = str(value or "").strip()
+            if url:
+                return url
+    return ""
+
+
+def _item_name_from_extra_metadata(row: Dict[str, Any]) -> str:
+    meta = _coerce_extra_metadata(row.get("extra_metadata"))
+    if not meta:
         return ""
     for key, value in meta.items():
         if _normalize_extra_metadata_key(key) == "item_name":
@@ -1059,16 +1086,7 @@ def _image_url_from_row(row: Dict[str, Any]) -> str:
     if direct:
         return direct
 
-    meta = row.get("extra_metadata")
-    if not isinstance(meta, dict):
-        return ""
-
-    for key, value in meta.items():
-        if _normalize_extra_metadata_key(key) == "image_url":
-            url = str(value or "").strip()
-            if url:
-                return url
-    return ""
+    return _metadata_image_url(_coerce_extra_metadata(row.get("extra_metadata")))
 
 
 def _derive_image_title(row: Dict[str, Any], target_item_names: List[str]) -> str:
@@ -2235,7 +2253,7 @@ class Retriever:
                     "page_path": row.get("page_path", ""),
                     "title": row.get("title", ""),
                     "image_url": row.get("image_url", ""),
-                    "extra_metadata": row.get("extra_metadata", {}),
+                    "extra_metadata": _coerce_extra_metadata(row.get("extra_metadata")),
                     "score": float(row.get("score") or 0.0),
                 }
             )
@@ -2257,16 +2275,13 @@ class Retriever:
                     img = str(extra.get("image_url") or "").strip()
                     if img and not str(row.get("image_url") or "").strip():
                         row["image_url"] = img
-                    meta = extra.get("extra_metadata")
-                    if isinstance(meta, dict) and meta:
+                    meta = _coerce_extra_metadata(extra.get("extra_metadata"))
+                    if meta:
                         row["extra_metadata"] = meta
                         if not str(row.get("image_url") or "").strip():
-                            for mk, mv in meta.items():
-                                if _normalize_extra_metadata_key(mk) == "image_url":
-                                    fallback_img = str(mv or "").strip()
-                                    if fallback_img:
-                                        row["image_url"] = fallback_img
-                                    break
+                            fallback_img = _metadata_image_url(meta)
+                            if fallback_img:
+                                row["image_url"] = fallback_img
             except SupabaseStoreError as exc:
                 log_event(
                     "retrieval_image_hydration_failed",
@@ -3095,6 +3110,21 @@ class ChatHandler(BaseHTTPRequestHandler):
                 intent=(turn.get("intent") if isinstance(turn, dict) else None),
             )
             images_payload = build_image_payload_from_decision(results, image_decision)
+            if bool(image_decision.get("include_images")) and not images_payload:
+                log_event(
+                    "images_requested_but_missing",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    session_id=session_id,
+                    retrieved_item_ids=[str(r.get("id") or "") for r in results],
+                    retrieved_has_direct_image_url=[bool(str(r.get("image_url") or "").strip()) for r in results],
+                    retrieved_has_metadata_image_url=[
+                        bool(_metadata_image_url(_coerce_extra_metadata(r.get("extra_metadata")))) for r in results
+                    ],
+                    retrieved_metadata_keys=[
+                        list(_coerce_extra_metadata(r.get("extra_metadata")).keys())[:10] for r in results
+                    ],
+                )
             if images_payload:
                 images_line = json.dumps(
                     {
