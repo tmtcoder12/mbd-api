@@ -1038,12 +1038,16 @@ def _is_generic_image_title(title: str) -> bool:
     return cleaned.startswith("menu ")
 
 
+def _normalize_extra_metadata_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(key or "").strip().lower()).strip("_")
+
+
 def _item_name_from_extra_metadata(row: Dict[str, Any]) -> str:
     meta = row.get("extra_metadata")
     if not isinstance(meta, dict):
         return ""
     for key, value in meta.items():
-        if str(key or "").strip().lower() == "item_name":
+        if _normalize_extra_metadata_key(key) == "item_name":
             item_name = str(value or "").strip()
             if item_name:
                 return item_name
@@ -1060,8 +1064,7 @@ def _image_url_from_row(row: Dict[str, Any]) -> str:
         return ""
 
     for key, value in meta.items():
-        normalized = str(key or "").strip().lower().replace("-", "_")
-        if normalized == "image_url":
+        if _normalize_extra_metadata_key(key) == "image_url":
             url = str(value or "").strip()
             if url:
                 return url
@@ -2259,14 +2262,18 @@ class Retriever:
                         row["extra_metadata"] = meta
                         if not str(row.get("image_url") or "").strip():
                             for mk, mv in meta.items():
-                                normalized = str(mk or "").strip().lower().replace("-", "_")
-                                if normalized == "image_url":
+                                if _normalize_extra_metadata_key(mk) == "image_url":
                                     fallback_img = str(mv or "").strip()
                                     if fallback_img:
                                         row["image_url"] = fallback_img
                                     break
-            except SupabaseStoreError:
-                pass
+            except SupabaseStoreError as exc:
+                log_event(
+                    "retrieval_image_hydration_failed",
+                    restaurant_id=restaurant_id,
+                    error=str(exc),
+                    chunk_ids=hydrate_ids[:10],
+                )
 
         t2 = time.perf_counter()
         results_for_llm = results[:MAX_SOURCES_SENT]
