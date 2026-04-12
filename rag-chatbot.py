@@ -1133,6 +1133,13 @@ def _derive_image_title(row: Dict[str, Any], target_item_names: List[str]) -> st
     return title or "Menu Item"
 
 
+def _row_matches_target_item_name(row: Dict[str, Any], target_names: List[str]) -> bool:
+    if not target_names:
+        return False
+    blob = f"{row.get('title','')} {row.get('text','')}".lower()
+    return any(name in blob for name in target_names)
+
+
 def build_image_payload_from_decision(
     results: List[Dict[str, Any]],
     image_decision: Dict[str, Any],
@@ -1146,19 +1153,13 @@ def build_image_payload_from_decision(
         return []
 
     target_names = [str(x).lower() for x in decision.get("target_item_names") or [] if str(x).strip()]
-    prioritized: List[Dict[str, Any]] = []
-    non_prioritized: List[Dict[str, Any]] = []
-    for row in results:
-        blob = f"{row.get('title','')} {row.get('text','')}".lower()
-        if target_names and any(name in blob for name in target_names):
-            prioritized.append(row)
-        else:
-            non_prioritized.append(row)
+    matched_rows = [row for row in results if _row_matches_target_item_name(row, target_names)]
+    if not matched_rows:
+        return []
 
-    ordered_rows = prioritized + non_prioritized
     out: List[Dict[str, Any]] = []
     seen_urls = set()
-    for row in ordered_rows:
+    for row in matched_rows:
         image_url = _image_url_from_row(row)
         if not image_url:
             continue
