@@ -1069,6 +1069,24 @@ def _metadata_image_url(meta: Dict[str, Any]) -> str:
     return ""
 
 
+def _priority_score_from_extra_metadata(row: Dict[str, Any]) -> float:
+    meta = _coerce_extra_metadata(row.get("extra_metadata"))
+    if not meta:
+        return 0.0
+    for key, value in meta.items():
+        if _normalize_extra_metadata_key(key) != "priority_score":
+            continue
+        if value is None:
+            return 0.0
+        if isinstance(value, str) and not value.strip():
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
 def _item_name_from_extra_metadata(row: Dict[str, Any]) -> str:
     meta = _coerce_extra_metadata(row.get("extra_metadata"))
     if not meta:
@@ -1398,6 +1416,12 @@ def retrieve_menu_items(
         matched_constraints: List[str] = []
         rid = str(row.get("id") or "")
         blob = f"{row.get('title','')} {row.get('text','')}".lower()
+        priority_score = _priority_score_from_extra_metadata(row)
+        priority_boost = 0.05 * priority_score
+
+        if priority_boost != 0:
+            score += priority_boost
+            reasons.append("priority_score_boost")
 
         if rid in discussed:
             score += 0.12
@@ -1423,6 +1447,8 @@ def retrieve_menu_items(
 
         out = row.copy()
         out["score"] = score
+        out["priority_score"] = priority_score
+        out["priority_boost"] = priority_boost
         out["boost_reason"] = reasons
         out["matched_constraints"] = matched_constraints
         reranked.append(out)
