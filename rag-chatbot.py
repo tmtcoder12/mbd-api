@@ -27,7 +27,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
@@ -125,6 +125,11 @@ DEFAULT_IMAGE_DECISION = {
     "max_images": 0,
     "target_item_names": [],
 }
+
+ASSISTANT_TEXT_START_MARKER = "<<<MBD_ASSISTANT_TEXT_START>>>"
+ASSISTANT_TEXT_END_MARKER = "<<<MBD_ASSISTANT_TEXT_END>>>"
+IMAGE_DECISION_JSON_START_MARKER = "<<<MBD_IMAGE_DECISION_JSON_START>>>"
+IMAGE_DECISION_JSON_END_MARKER = "<<<MBD_IMAGE_DECISION_JSON_END>>>"
 
 GENERIC_IMAGE_TITLES = {
     "",
@@ -1515,10 +1520,197 @@ def _extract_first_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _strip_one_leading_linebreak(text: str) -> str:
+    if text.startswith("\r\n"):
+        return text[2:]
+    if text.startswith("\n"):
+        return text[1:]
+    return text
+
+
+def _strip_one_trailing_linebreak(text: str) -> str:
+    if text.endswith("\r\n"):
+        return text[:-2]
+    if text.endswith("\n"):
+        return text[:-1]
+    return text
+
+
+def _event_attr(event: Any, name: str, default: Any = None) -> Any:
+    if isinstance(event, dict):
+        return event.get(name, default)
+    return getattr(event, name, default)
+
+
+def _response_id_from_obj(value: Any) -> Optional[str]:
+    response_id = _event_attr(value, "id")
+    if response_id:
+        return str(response_id)
+    return None
+
+
+def _extract_stream_delta(event: Any) -> str:
+    event_type = str(_event_attr(event, "type", "") or "")
+    if event_type not in {"response.output_text.delta", "response.refusal.delta", "output_text.delta"}:
+        return ""
+    return str(_event_attr(event, "delta", "") or "")
+
+
+def _extract_stream_response(event: Any) -> Optional[Any]:
+    response = _event_attr(event, "response")
+    if response is not None:
+        return response
+    if str(_event_attr(event, "type", "") or "") == "response.completed":
+        return event
+    return None
+
+
+def _extract_stream_error(event: Any) -> Optional[str]:
+    if str(_event_attr(event, "type", "") or "") != "response.error":
+        return None
+    error = _event_attr(event, "error")
+    if error is None:
+        return "OpenAI streaming response failed"
+    message = _event_attr(error, "message")
+    return str(message or error)
+
+
+def _extract_tagged_assistant_response_and_images(raw_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+    raw = raw_text or ""
+    start_idx = raw.find(ASSISTANT_TEXT_START_MARKER)
+    if start_idx == -1:
+        return None
+
+    content_start_idx = start_idx + len(ASSISTANT_TEXT_START_MARKER)
+    image_start_idx = raw.find(IMAGE_DECISION_JSON_START_MARKER, content_start_idx)
+    end_idx = raw.find(ASSISTANT_TEXT_END_MARKER, content_start_idx)
+    if end_idx == -1 and image_start_idx != -1:
+        end_idx = image_start_idx
+    if end_idx == -1 or end_idx <= start_idx:
+        return None
+
+    assistant_text = raw[start_idx + len(ASSISTANT_TEXT_START_MARKER) : end_idx]
+    assistant_text = _strip_one_trailing_linebreak(_strip_one_leading_linebreak(assistant_text)).strip()
+
+    image_decision = dict(DEFAULT_IMAGE_DECISION)
+    if image_start_idx == -1:
+        image_start_idx = raw.find(IMAGE_DECISION_JSON_START_MARKER, end_idx + len(ASSISTANT_TEXT_END_MARKER))
+    image_end_idx = raw.find(IMAGE_DECISION_JSON_END_MARKER, image_start_idx + len(IMAGE_DECISION_JSON_START_MARKER))
+    if image_start_idx != -1 and image_end_idx != -1 and image_end_idx > image_start_idx:
+        image_blob = raw[image_start_idx + len(IMAGE_DECISION_JSON_START_MARKER) : image_end_idx].strip()
+        try:
+            parsed = json.loads(image_blob)
+        except json.JSONDecodeError:
+            parsed = None
+        image_decision = _normalize_image_decision(parsed)
+
+    return assistant_text, image_decision
+
+
+class AssistantTaggedStreamParser:
+    def __init__(self) -> None:
+        self._state = "before_text"
+        self._buffer = ""
+        self._raw_parts: List[str] = []
+        self._assistant_parts: List[str] = []
+        self._trim_leading_linebreak = False
+
+    def _record(self, text: str) -> str:
+        if text:
+            self._assistant_parts.append(text)
+        return text
+
+    def _maybe_trim_leading_linebreak(self) -> bool:
+        if not self._trim_leading_linebreak:
+            return False
+        if self._buffer == "\r":
+            return True
+        self._buffer = _strip_one_leading_linebreak(self._buffer)
+        self._trim_leading_linebreak = False
+        return False
+
+    def feed(self, delta: str) -> List[str]:
+        if not delta:
+            return []
+        self._raw_parts.append(delta)
+        self._buffer += delta
+
+        emitted: List[str] = []
+        while True:
+            if self._state == "before_text":
+                marker_idx = self._buffer.find(ASSISTANT_TEXT_START_MARKER)
+                if marker_idx == -1:
+                    tail_len = len(ASSISTANT_TEXT_START_MARKER) - 1
+                    if len(self._buffer) > tail_len:
+                        self._buffer = self._buffer[-tail_len:]
+                    break
+                self._buffer = self._buffer[marker_idx + len(ASSISTANT_TEXT_START_MARKER) :]
+                self._state = "in_text"
+                self._trim_leading_linebreak = True
+                continue
+
+            if self._state == "in_text":
+                if self._maybe_trim_leading_linebreak():
+                    break
+                text_end_idx = self._buffer.find(ASSISTANT_TEXT_END_MARKER)
+                image_start_idx = self._buffer.find(IMAGE_DECISION_JSON_START_MARKER)
+                marker_options = [idx for idx in (text_end_idx, image_start_idx) if idx != -1]
+                if marker_options:
+                    marker_idx = min(marker_options)
+                    text = _strip_one_trailing_linebreak(self._buffer[:marker_idx])
+                    if text:
+                        emitted.append(self._record(text))
+                    if marker_idx == text_end_idx:
+                        self._buffer = self._buffer[marker_idx + len(ASSISTANT_TEXT_END_MARKER) :]
+                    else:
+                        self._buffer = self._buffer[marker_idx:]
+                    self._state = "after_text"
+                    break
+
+                tail_len = max(len(ASSISTANT_TEXT_END_MARKER), len(IMAGE_DECISION_JSON_START_MARKER)) - 1
+                if len(self._buffer) > tail_len:
+                    text = self._buffer[:-tail_len]
+                    self._buffer = self._buffer[-tail_len:]
+                    if text:
+                        emitted.append(self._record(text))
+                break
+
+            break
+
+        return emitted
+
+    def finish(self) -> Tuple[List[str], str, Dict[str, Any]]:
+        emitted: List[str] = []
+        if self._state == "in_text":
+            self._maybe_trim_leading_linebreak()
+            if self._buffer:
+                emitted.append(self._record(self._buffer))
+            self._buffer = ""
+
+        raw_text = "".join(self._raw_parts)
+        tagged = _extract_tagged_assistant_response_and_images(raw_text)
+        if tagged is not None:
+            assistant_text, image_decision = tagged
+            return emitted, assistant_text, image_decision
+
+        assistant_text = "".join(self._assistant_parts).strip()
+        if assistant_text:
+            return emitted, assistant_text, dict(DEFAULT_IMAGE_DECISION)
+
+        assistant_text, image_decision = _extract_assistant_response_and_images(raw_text)
+        if assistant_text:
+            emitted.append(assistant_text)
+        return emitted, assistant_text, image_decision
+
+
 def _extract_assistant_response_and_images(raw_text: str) -> Tuple[str, Dict[str, Any]]:
     default_text = (raw_text or "").strip()
     if not default_text:
         default_text = "I’m sorry, I couldn’t generate a response right now."
+
+    tagged = _extract_tagged_assistant_response_and_images(raw_text)
+    if tagged is not None:
+        return tagged
 
     parsed = _extract_first_json_object(raw_text)
     if not parsed:
@@ -1538,6 +1730,7 @@ def create_assistant_response(
     menu_context: str,
     session_context: str,
     previous_response_id: Optional[str],
+    assistant_delta_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, Optional[str], Dict[str, Any]]:
     user_payload = (
         "Session context:\n"
@@ -1546,17 +1739,17 @@ def create_assistant_response(
         f"{menu_context or '[no menu context found]'}\n\n"
         "Current user message:\n"
         f"{user_query}\n\n"
-        "Return ONLY a valid JSON object with this shape:\n"
-        "{\n"
-        '  "assistant_text": "string",\n'
-        '  "image_decision": {\n'
-        '    "include_images": true|false,\n'
-        '    "max_images": 0..3,\n'
-        '    "target_item_names": ["optional item names"]\n'
-        "  }\n"
-        "}\n"
+        "Return ONLY this exact tagged envelope, with no markdown and no extra text:\n"
+        f"{ASSISTANT_TEXT_START_MARKER}\n"
+        "user-facing assistant text\n"
+        f"{ASSISTANT_TEXT_END_MARKER}\n"
+        f"{IMAGE_DECISION_JSON_START_MARKER}\n"
+        '{"include_images":false,"max_images":0,"target_item_names":[]}\n'
+        f"{IMAGE_DECISION_JSON_END_MARKER}\n"
         "Rules:\n"
         "- Keep assistant_text concise and natural.\n"
+        "- Put only the customer-facing answer inside the assistant text markers.\n"
+        "- Put only valid JSON inside the image decision JSON markers.\n"
         "- include_images=true only when user intent suggests recommendations or seeing photos.\n"
         "- For one specific dish, prefer max_images=1 and set target_item_names.\n"
         "- For broad recommendations, max_images can be up to 3.\n"
@@ -1569,10 +1762,53 @@ def create_assistant_response(
     }
     if previous_response_id:
         kwargs["previous_response_id"] = previous_response_id
-    resp = client.responses.create(**kwargs)
-    raw_text = _extract_response_text(resp).strip()
-    assistant_text, image_decision = _extract_assistant_response_and_images(raw_text)
-    return assistant_text, getattr(resp, "id", None), image_decision
+
+    parser = AssistantTaggedStreamParser()
+    response_id: Optional[str] = None
+
+    def _handle_event(event: Any) -> None:
+        nonlocal response_id
+        error = _extract_stream_error(event)
+        if error:
+            raise RuntimeError(error)
+
+        response = _extract_stream_response(event)
+        if response is not None:
+            response_id = _response_id_from_obj(response) or response_id
+
+        delta = _extract_stream_delta(event)
+        for text in parser.feed(delta):
+            if assistant_delta_callback is not None:
+                assistant_delta_callback(text)
+
+    stream_factory = getattr(client.responses, "stream", None)
+    if callable(stream_factory):
+        with stream_factory(**kwargs) as stream:
+            for event in stream:
+                _handle_event(event)
+            final_response_getter = getattr(stream, "get_final_response", None)
+            if callable(final_response_getter):
+                response_id = _response_id_from_obj(final_response_getter()) or response_id
+    else:
+        stream_kwargs = dict(kwargs)
+        stream_kwargs["stream"] = True
+        try:
+            stream = client.responses.create(**stream_kwargs)
+        except TypeError:
+            resp = client.responses.create(**kwargs)
+            raw_text = _extract_response_text(resp).strip()
+            assistant_text, image_decision = _extract_assistant_response_and_images(raw_text)
+            if assistant_delta_callback is not None and assistant_text:
+                assistant_delta_callback(assistant_text)
+            return assistant_text, getattr(resp, "id", None), image_decision
+        for event in stream:
+            _handle_event(event)
+
+    late_chunks, assistant_text, image_decision = parser.finish()
+    for text in late_chunks:
+        if assistant_delta_callback is not None:
+            assistant_delta_callback(text)
+    return assistant_text, response_id, image_decision
 
 
 def infer_new_session_state(
@@ -1627,6 +1863,7 @@ def handle_chat_turn(
     query_cache_classifier_model: str = QUERY_CACHE_CLASSIFIER_MODEL_DEFAULT,
     query_cache_classifier_timeout_ms: int = QUERY_CACHE_CLASSIFIER_TIMEOUT_MS_DEFAULT,
     request_id: Optional[str] = None,
+    assistant_delta_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     raw_query = (user_query or "").strip()
     exact_query = _exact_query_for_cache(raw_query)
@@ -2064,6 +2301,7 @@ def handle_chat_turn(
         menu_context=menu_context,
         session_context=session_context,
         previous_response_id=session_state.get("last_response_id"),
+        assistant_delta_callback=assistant_delta_callback,
     )
     new_state = infer_new_session_state(
         session_state,
@@ -3058,6 +3296,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         assistant_text = ""
         results: List[Dict[str, Any]] = []
         turn: Optional[Dict[str, Any]] = None
+        streamed_text_chunks: List[str] = []
         try:
             session_line = json.dumps(
                 {
@@ -3080,6 +3319,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                 previous_response_id=session_state.get("last_response_id"),
             )
 
+            def _write_assistant_delta(content: str) -> None:
+                if not content:
+                    return
+                streamed_text_chunks.append(content)
+                line = json.dumps({"type": "delta", "content": content}, ensure_ascii=False) + "\n"
+                self._write_chunk(line)
+
             turn = handle_chat_turn(
                 client=self.client,
                 retriever=self.retriever,
@@ -3099,6 +3345,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 query_cache_classifier_model=self.query_cache_classifier_model,
                 query_cache_classifier_timeout_ms=self.query_cache_classifier_timeout_ms,
                 request_id=request_id,
+                assistant_delta_callback=_write_assistant_delta,
             )
             assistant_text = (turn.get("assistant_text") or "").strip()
             results = list(turn.get("results") or [])
@@ -3121,9 +3368,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 cache_hit_stage=turn.get("cache_hit_stage"),
             )
 
-            if assistant_text:
-                line = json.dumps({"type": "delta", "content": assistant_text}, ensure_ascii=False) + "\n"
-                self._write_chunk(line)
+            if assistant_text and not streamed_text_chunks:
+                _write_assistant_delta(assistant_text)
 
             image_decision = dict(DEFAULT_IMAGE_DECISION)
             if isinstance(turn, dict):
