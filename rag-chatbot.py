@@ -1400,6 +1400,7 @@ def retrieve_menu_items(
     min_score: float,
     session_state: Dict[str, Any],
     active_constraints: Dict[str, Any],
+    query_embedding: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     prep = retriever.retrieve(
         client=client,
@@ -1407,6 +1408,7 @@ def retrieve_menu_items(
         top_k=max(top_k * 2, top_k),
         min_score=min_score,
         restaurant_id=restaurant_id,
+        query_embedding=query_embedding,
     )
     base_results = prep["results"]
 
@@ -2256,6 +2258,7 @@ def handle_chat_turn(
         min_score=min_score,
         session_state=session_state,
         active_constraints=active_constraints,
+        query_embedding=semantic_query_embedding,
     )
     results = retrieved["results"]
 
@@ -2494,16 +2497,19 @@ class Retriever:
         top_k: int,
         min_score: float,
         restaurant_id: Optional[str] = None,
+        query_embedding: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        qvec = embed_query(client, user_q)
+        if query_embedding is None:
+            qvec = embed_query(client, user_q)
+            query_embedding = qvec[0].tolist()
         t1 = time.perf_counter()
 
         if not restaurant_id:
             raise RuntimeError("restaurantId is required for retrieval")
         rows = self.supabase_store.match_chunks(
             restaurant_id,
-            qvec[0].tolist(),
+            query_embedding,
             match_count=top_k,
             min_score=min_score,
         )
@@ -2774,6 +2780,54 @@ class ChatHandler(BaseHTTPRequestHandler):
             return custom_prompt.replace("{language}", language)
         return DEFAULT_SYSTEM_INSTRUCTIONS.replace("{language}", language)
 
+    def _system_instructions_from_prompt(self, custom_prompt: Optional[str], language: str) -> str:
+        prompt = (custom_prompt or "").strip()
+        if prompt:
+            return prompt.replace("{language}", language)
+        return DEFAULT_SYSTEM_INSTRUCTIONS.replace("{language}", language)
+
+    def _load_chat_access_context(
+        self,
+        restaurant_id: str,
+        origin: str,
+        request_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if self.store is None:
+            self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
+            return None
+        try:
+            access_context = self.store.chat_access_context(
+                restaurant_id,
+                origin,
+                origin_preallowed=self.allow_localhost_origins and self._is_localhost_origin(origin),
+            )
+        except SupabaseStoreError as exc:
+            self._send_json_error(502, f"Failed to validate restaurantId: {exc}", request_id=request_id)
+            return None
+
+        if not access_context.get("restaurant_exists"):
+            self._send_json_error(400, "restaurantId does not exist", request_id=request_id)
+            return None
+        if not access_context.get("subscription_active"):
+            self._insert_audit_event_safe(
+                "subscription_inactive_block",
+                restaurant_id=restaurant_id,
+                actor="chat_api",
+                details={"request_id": request_id},
+            )
+            self._send_json_error(403, "Restaurant subscription is inactive", request_id=request_id)
+            return None
+        if not access_context.get("origin_allowed"):
+            self._send_json_error(403, "Origin is not allowed for this restaurant", request_id=request_id)
+            self._insert_audit_event_safe(
+                "origin_mismatch",
+                restaurant_id=restaurant_id,
+                actor="chat_api",
+                details={"request_id": request_id, "origin": origin},
+            )
+            return None
+        return access_context
+
     def _load_session_state(self, session_id: str, request_id: str) -> Dict[str, Any]:
         if self.store is None:
             state = dict(DEFAULT_SESSION_STATE)
@@ -2796,6 +2850,42 @@ class ChatHandler(BaseHTTPRequestHandler):
             state = dict(DEFAULT_SESSION_STATE)
             state["session_id"] = session_id
             return state
+
+    def _bootstrap_chat_session(
+        self,
+        restaurant_id: str,
+        session_token: str,
+        client_meta: Dict[str, Any],
+        requested_language: Optional[str],
+        request_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if self.store is None:
+            self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
+            return None
+        try:
+            session_row = self.store.chat_session_bootstrap(
+                restaurant_id,
+                session_token,
+                client_meta,
+                language=requested_language,
+            )
+            session_id = str(session_row.get("session_id") or "")
+            if not session_id:
+                raise SupabaseStoreError("chat_session_bootstrap did not return session_id")
+            try:
+                stored_language = normalize_session_language(session_row.get("language"))
+            except ValueError:
+                stored_language = None
+            session_state = _copy_session_state(session_row.get("session_state") or {})
+            session_state["session_id"] = session_id
+            return {
+                "session_id": session_id,
+                "language": stored_language or requested_language or DEFAULT_SESSION_LANGUAGE,
+                "session_state": session_state,
+            }
+        except (SupabaseStoreError, ValueError) as exc:
+            self._send_json_error(502, f"Failed to persist chat session: {exc}", request_id=request_id)
+            return None
 
     def _persist_session_state(self, session_id: str, new_state: Dict[str, Any], request_id: str) -> None:
         if self.store is None:
@@ -2888,6 +2978,57 @@ class ChatHandler(BaseHTTPRequestHandler):
                     error=str(exc),
                     latency_ms=int((time.perf_counter() - t0) * 1000),
                 )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _schedule_user_message_persistence(
+        self,
+        session_id: Optional[str],
+        user_query: str,
+        restaurant_id: str,
+        request_id: str,
+        stream_closed_event: threading.Event,
+    ) -> None:
+        if not self.persist_chat or not session_id or self.store is None:
+            return
+
+        store = self.store
+
+        def _worker():
+            message_id: Optional[str] = None
+            t0 = time.perf_counter()
+            try:
+                user_row = store.insert_message(session_id, "user", user_query, return_row=True)
+                if user_row is not None:
+                    row_id = user_row.get("id")
+                    if row_id:
+                        message_id = str(row_id)
+                log_event(
+                    "user_message_persisted",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    "user_message_persist_failed",
+                    request_id=request_id,
+                    restaurant_id=restaurant_id,
+                    session_id=session_id,
+                    error=str(exc),
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+                return
+
+            stream_closed_event.wait()
+            self._schedule_query_type_classification(
+                message_id,
+                user_query,
+                restaurant_id=restaurant_id,
+                request_id=request_id,
+            )
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3204,10 +3345,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc), request_id=request_id)
             return
 
-        security_settings = self._load_restaurant_access_settings(restaurant_id, request_id)
-        if security_settings is None:
-            return
-        if not self._origin_guard(restaurant_id, origin, request_id):
+        access_context = self._load_chat_access_context(restaurant_id, origin, request_id)
+        if access_context is None:
             return
 
         widget_token = (payload.get("widgetToken") or "").strip()
@@ -3217,7 +3356,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self.widget_signing_keys,
                 expected_restaurant_id=restaurant_id,
                 expected_origin=origin,
-                max_age_seconds=int(security_settings["token_max_age_seconds"]),
+                max_age_seconds=int(access_context["token_max_age_seconds"]),
             )
         except ValueError as exc:
             self._send_json_error(403, str(exc), request_id=request_id)
@@ -3230,13 +3369,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             [
                 (
                     ip_rate_key,
-                    int(security_settings["ip_max_requests"]),
-                    int(security_settings["ip_window_seconds"]),
+                    int(access_context["ip_max_requests"]),
+                    int(access_context["ip_window_seconds"]),
                 ),
                 (
                     session_rate_key,
-                    int(security_settings["session_max_requests"]),
-                    int(security_settings["session_window_seconds"]),
+                    int(access_context["session_max_requests"]),
+                    int(access_context["session_window_seconds"]),
                 ),
             ],
             request_id=request_id,
@@ -3246,44 +3385,24 @@ class ChatHandler(BaseHTTPRequestHandler):
         ):
             return
 
-        session_id = None
-        user_message_id = None
-        resolved_language = DEFAULT_SESSION_LANGUAGE
-        if self.store is None:
-            self._send_json_error(500, "Supabase store is not configured", request_id=request_id)
-            return
-        try:
-            session_row = self.store.upsert_session(
-                restaurant_id,
-                session_token,
-                self._extract_client_meta(),
-                language=requested_language,
-            )
-            session_id = str(session_row.get("session_id") or "")
-            if not session_id:
-                raise SupabaseStoreError("upsert_session did not return session_id")
-            try:
-                stored_language = normalize_session_language(session_row.get("language"))
-            except ValueError:
-                stored_language = None
-            resolved_language = stored_language or requested_language or DEFAULT_SESSION_LANGUAGE
-            if self.persist_chat:
-                user_row = self.store.insert_message(session_id, "user", user_msg, return_row=True)
-                if user_row is not None:
-                    row_id = user_row.get("id")
-                    if row_id:
-                        user_message_id = str(row_id)
-        except (SupabaseStoreError, ValueError) as exc:
-            self._send_json_error(502, f"Failed to persist chat session: {exc}", request_id=request_id)
-            return
-
-        system_instructions = self._load_system_instructions(
+        session_bootstrap = self._bootstrap_chat_session(
             restaurant_id,
+            session_token,
+            self._extract_client_meta(),
+            requested_language,
             request_id,
-            language=resolved_language,
         )
-        if system_instructions is None:
+        if session_bootstrap is None:
             return
+        session_id = str(session_bootstrap["session_id"])
+        resolved_language = str(session_bootstrap["language"])
+        session_state = _copy_session_state(session_bootstrap["session_state"])
+        session_state["session_id"] = session_id
+        system_instructions = self._system_instructions_from_prompt(
+            access_context.get("system_prompt"),
+            resolved_language,
+        )
+        stream_closed_event = threading.Event()
 
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -3308,7 +3427,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             ) + "\n"
             self._write_chunk(session_line)
 
-            session_state = self._load_session_state(session_id, request_id)
+            self._schedule_user_message_persistence(
+                session_id,
+                user_msg,
+                restaurant_id=restaurant_id,
+                request_id=request_id,
+                stream_closed_event=stream_closed_event,
+            )
             log_event(
                 "chat_turn_start",
                 request_id=request_id,
@@ -3422,13 +3547,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             done_line = json.dumps({"type": "done"}) + "\n"
             self._write_chunk(done_line)
             self._end_chunked()
-
-            self._schedule_query_type_classification(
-                user_message_id,
-                user_msg,
-                restaurant_id=restaurant_id,
-                request_id=request_id,
-            )
+            stream_closed_event.set()
 
             if turn is not None:
                 self._persist_session_state(
@@ -3466,13 +3585,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self._end_chunked()
             except Exception:  # noqa: BLE001
                 pass
-
-            self._schedule_query_type_classification(
-                user_message_id,
-                user_msg,
-                restaurant_id=restaurant_id,
-                request_id=request_id,
-            )
+            stream_closed_event.set()
 
             if self.persist_chat and session_id is not None:
                 try:

@@ -2,4 +2,5 @@ openai
 numpy
 python-dotenv
 redis
+requests
 stripe

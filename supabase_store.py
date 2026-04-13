@@ -6,9 +6,17 @@ import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+try:
+    import requests
+except ModuleNotFoundError:
+    requests = None
+    _RequestsHTTPError = Exception
+    _RequestsRequestException = Exception
+else:
+    _RequestsHTTPError = requests.HTTPError
+    _RequestsRequestException = requests.RequestException
 
 
 class SupabaseStoreError(RuntimeError):
@@ -17,6 +25,8 @@ class SupabaseStoreError(RuntimeError):
 
 class SupabaseStore:
     def __init__(self, url: str, service_role_key: str, timeout_s: float = 30.0):
+        if requests is None:
+            raise SupabaseStoreError("requests package is required for SupabaseStore")
         self.base_url = url.rstrip("/")
         self.timeout_s = timeout_s
         self.headers = {
@@ -24,6 +34,8 @@ class SupabaseStore:
             "Authorization": f"Bearer {service_role_key}",
             "Content-Type": "application/json",
         }
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
 
     def _request(
         self,
@@ -41,25 +53,31 @@ class SupabaseStore:
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-        req = Request(f"{self.base_url}{path}{qs}", data=body, method=method.upper())
-        for k, v in self.headers.items():
-            req.add_header(k, v)
+        headers: Dict[str, str] = {}
         if prefer:
-            req.add_header("Prefer", prefer)
+            headers["Prefer"] = prefer
 
         try:
-            with urlopen(req, timeout=self.timeout_s) as resp:
-                raw = resp.read().decode("utf-8")
-                if not raw:
-                    return None
-                ct = resp.headers.get("Content-Type", "")
-                if "application/json" in ct:
-                    return json.loads(raw)
-                return raw
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise SupabaseStoreError(f"HTTP {exc.code} {method} {path}: {detail}") from exc
-        except URLError as exc:
+            resp = self.session.request(
+                method.upper(),
+                f"{self.base_url}{path}{qs}",
+                data=body,
+                headers=headers or None,
+                timeout=self.timeout_s,
+            )
+            resp.raise_for_status()
+            raw = resp.text
+            if not raw:
+                return None
+            ct = resp.headers.get("Content-Type", "")
+            if "application/json" in ct:
+                return json.loads(raw)
+            return raw
+        except _RequestsHTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            detail = exc.response.text if exc.response is not None else str(exc)
+            raise SupabaseStoreError(f"HTTP {status} {method} {path}: {detail}") from exc
+        except _RequestsRequestException as exc:
             raise SupabaseStoreError(f"Network error calling Supabase: {exc}") from exc
 
     @staticmethod
@@ -398,6 +416,82 @@ class SupabaseStore:
             "token_max_age_seconds": 900,
             "token_issue_max_requests": 30,
             "token_issue_window_seconds": 60,
+        }
+
+    def chat_access_context(
+        self,
+        restaurant_id: str,
+        origin: str,
+        origin_preallowed: bool = False,
+    ) -> Dict[str, Any]:
+        rid = self._require_uuid(restaurant_id, "restaurant_id")
+        payload = {
+            "p_restaurant_id": rid,
+            "p_origin": self._normalize_origin(origin),
+            "p_origin_preallowed": bool(origin_preallowed),
+        }
+        data = self._request("POST", "/rest/v1/rpc/chat_access_context", payload=payload)
+        row: Optional[Dict[str, Any]] = None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            row = data[0]
+        elif isinstance(data, dict):
+            row = data
+        if row is None:
+            raise SupabaseStoreError("chat_access_context did not return row data")
+
+        return {
+            "restaurant_exists": bool(row.get("restaurant_exists")),
+            "subscription_active": bool(row.get("subscription_active")),
+            "origin_allowed": bool(row.get("origin_allowed")),
+            "ip_max_requests": int(row.get("ip_max_requests") or 30),
+            "ip_window_seconds": int(row.get("ip_window_seconds") or 60),
+            "session_max_requests": int(row.get("session_max_requests") or 45),
+            "session_window_seconds": int(row.get("session_window_seconds") or 60),
+            "token_max_age_seconds": int(row.get("token_max_age_seconds") or 900),
+            "token_issue_max_requests": int(row.get("token_issue_max_requests") or 30),
+            "token_issue_window_seconds": int(row.get("token_issue_window_seconds") or 60),
+            "system_prompt": row.get("system_prompt") if isinstance(row.get("system_prompt"), str) else None,
+        }
+
+    def chat_session_bootstrap(
+        self,
+        restaurant_id: str,
+        session_token: str,
+        client_meta: Optional[Dict[str, Any]] = None,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        rid = self._require_uuid(restaurant_id, "restaurant_id")
+        payload = {
+            "p_restaurant_id": rid,
+            "p_session_token": session_token,
+            "p_client_meta": client_meta or {},
+            "p_language": (language or "").strip() or None,
+        }
+        data = self._request("POST", "/rest/v1/rpc/chat_session_bootstrap", payload=payload)
+        row: Optional[Dict[str, Any]] = None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            row = data[0]
+        elif isinstance(data, dict):
+            row = data
+        if row is None:
+            raise SupabaseStoreError("chat_session_bootstrap did not return row data")
+
+        session_id = row.get("session_id")
+        if not session_id:
+            raise SupabaseStoreError("chat_session_bootstrap did not return session_id")
+        session_language = row.get("language")
+        session_state = {
+            "session_id": str(session_id),
+            "last_response_id": row.get("last_response_id"),
+            "last_discussed_item_ids": row.get("last_discussed_item_ids") or [],
+            "last_candidate_item_ids": row.get("last_candidate_item_ids") or [],
+            "last_intent": row.get("last_intent"),
+            "active_constraints": row.get("active_constraints") or {},
+        }
+        return {
+            "session_id": str(session_id),
+            "language": str(session_language).strip() if session_language is not None else None,
+            "session_state": session_state,
         }
 
     def insert_audit_event(
