@@ -12,6 +12,7 @@ Request body for POST /api/chat-stream must include:
   message: string
   restaurantId: UUID string
   sessionToken: UUID string (optional; server generates if missing)
+  newSession: boolean (optional; ignore sessionToken and start a fresh persisted session)
   widgetToken: signed JWT (required)
   language: ISO 639-3 string (optional; defaults to session language or eng)
 """
@@ -575,6 +576,16 @@ def parse_bool_env(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_bool_payload(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def normalize_or_create_session_token(token: str) -> Tuple[str, bool]:
@@ -2614,13 +2625,16 @@ class ChatHandler(BaseHTTPRequestHandler):
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
     _cors_origin: Optional[str] = None
+    _cors_allow_headers: Optional[str] = None
 
     def end_headers(self):
         if self._cors_origin:
             self.send_header("Access-Control-Allow-Origin", self._cors_origin)
             self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", self._cors_allow_headers or "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        if self.command == "OPTIONS":
+            self.send_header("Access-Control-Max-Age", "600")
         super().end_headers()
 
     def _normalize_origin(self, origin: str) -> str:
@@ -3090,12 +3104,26 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         origin = self._normalize_origin(self.headers.get("Origin", ""))
-        if not self._is_origin_allowed_preflight(origin):
-            self.send_response(403)
+        parsed = urlparse(self.path).path
+        if parsed not in {"/api/widget-token", "/api/chat-stream", "/api/stripe/webhook", "/healthz"}:
+            if origin:
+                self._cors_origin = origin
+                self._cors_allow_headers = self.headers.get("Access-Control-Request-Headers")
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
+
+        if not origin:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         self._cors_origin = origin
+        self._cors_allow_headers = self.headers.get("Access-Control-Request-Headers")
         self.send_response(204)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
@@ -3327,11 +3355,14 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "message is required", request_id=request_id)
             return
 
+        new_session_requested = parse_bool_payload(payload.get("newSession"))
+        session_token_input = "" if new_session_requested else payload.get("sessionToken") or ""
         try:
-            session_token, generated = normalize_or_create_session_token(payload.get("sessionToken") or "")
+            session_token, generated = normalize_or_create_session_token(session_token_input)
         except ValueError as exc:
             self._send_json_error(400, str(exc), request_id=request_id)
             return
+        generated = bool(generated or new_session_requested)
 
         try:
             restaurant_id = normalize_restaurant_id(payload.get("restaurantId") or "")
@@ -3440,6 +3471,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 restaurant_id=restaurant_id,
                 session_id=session_id,
                 language=resolved_language,
+                new_session_requested=new_session_requested,
+                generated_session_token=generated,
                 raw_user_query=user_msg,
                 previous_response_id=session_state.get("last_response_id"),
             )
@@ -3575,6 +3608,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 client_ip_hash=client_ip_hash,
                 language=resolved_language,
                 status=200,
+                new_session_requested=new_session_requested,
+                generated_session_token=generated,
                 latency_ms=int((time.perf_counter() - start) * 1000),
                 sources_count=len(results),
             )
@@ -3608,6 +3643,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 client_ip_hash=client_ip_hash,
                 language=resolved_language,
                 status=500,
+                new_session_requested=new_session_requested,
+                generated_session_token=generated,
                 error=str(exc),
                 latency_ms=int((time.perf_counter() - start) * 1000),
             )

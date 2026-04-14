@@ -116,12 +116,14 @@ Required:
   "message": "What are your most popular dishes?",
   "restaurantId": "11111111-1111-1111-1111-111111111111",
   "sessionToken": "22222222-2222-2222-2222-222222222222",
+  "newSession": false,
   "widgetToken": "<jwt from /api/widget-token>",
   "language": "eng"
 }
 ```
 
 `sessionToken` is optional; if omitted, server generates one and sends it in first stream event.
+`newSession` is optional; send `true` only for the first message after the UI starts a fresh chat. The backend will ignore any supplied `sessionToken`, create a new persisted chat session, and stream the new token back for follow-up messages in that chat.
 `language` is optional; when omitted, the backend uses the stored session language or defaults to `eng`.
 
 Streaming event types:
