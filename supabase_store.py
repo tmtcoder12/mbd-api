@@ -24,6 +24,12 @@ class SupabaseStoreError(RuntimeError):
 
 
 class SupabaseStore:
+    _NETWORK_RETRY_RPC_PATHS = {
+        "/rest/v1/rpc/chat_access_context",
+        "/rest/v1/rpc/match_chunks",
+        "/rest/v1/rpc/restaurant_has_active_subscription",
+    }
+
     def __init__(self, url: str, service_role_key: str, timeout_s: float = 30.0):
         if requests is None:
             raise SupabaseStoreError("requests package is required for SupabaseStore")
@@ -34,8 +40,27 @@ class SupabaseStore:
             "Authorization": f"Bearer {service_role_key}",
             "Content-Type": "application/json",
         }
-        self.session = requests.Session()
-        self.session.headers.update(self.headers)
+        self.session = self._build_session()
+
+    def _build_session(self):
+        session = requests.Session()
+        session.headers.update(self.headers)
+        return session
+
+    @classmethod
+    def _network_retry_allowed(cls, method: str, path: str) -> bool:
+        method_upper = method.upper()
+        return method_upper == "GET" or (method_upper == "POST" and path in cls._NETWORK_RETRY_RPC_PATHS)
+
+    @staticmethod
+    def _close_session_quietly(session: Any) -> None:
+        close = getattr(session, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            pass
 
     def _request(
         self,
@@ -57,28 +82,39 @@ class SupabaseStore:
         if prefer:
             headers["Prefer"] = prefer
 
-        try:
-            resp = self.session.request(
-                method.upper(),
-                f"{self.base_url}{path}{qs}",
-                data=body,
-                headers=headers or None,
-                timeout=self.timeout_s,
-            )
-            resp.raise_for_status()
-            raw = resp.text
-            if not raw:
-                return None
-            ct = resp.headers.get("Content-Type", "")
-            if "application/json" in ct:
-                return json.loads(raw)
-            return raw
-        except _RequestsHTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "unknown"
-            detail = exc.response.text if exc.response is not None else str(exc)
-            raise SupabaseStoreError(f"HTTP {status} {method} {path}: {detail}") from exc
-        except _RequestsRequestException as exc:
-            raise SupabaseStoreError(f"Network error calling Supabase: {exc}") from exc
+        attempts = 2 if self._network_retry_allowed(method, path) else 1
+        for attempt in range(attempts):
+            is_retry = attempt > 0
+            session = self._build_session() if is_retry else self.session
+            try:
+                resp = session.request(
+                    method.upper(),
+                    f"{self.base_url}{path}{qs}",
+                    data=body,
+                    headers=headers or None,
+                    timeout=self.timeout_s,
+                )
+                resp.raise_for_status()
+                raw = resp.text
+                if not raw:
+                    return None
+                ct = resp.headers.get("Content-Type", "")
+                if "application/json" in ct:
+                    return json.loads(raw)
+                return raw
+            except _RequestsHTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                detail = exc.response.text if exc.response is not None else str(exc)
+                raise SupabaseStoreError(f"HTTP {status} {method} {path}: {detail}") from exc
+            except _RequestsRequestException as exc:
+                if attempt + 1 < attempts:
+                    continue
+                raise SupabaseStoreError(f"Network error calling Supabase: {exc}") from exc
+            finally:
+                if is_retry:
+                    self._close_session_quietly(session)
+
+        raise SupabaseStoreError(f"Network error calling Supabase: exhausted retries for {method} {path}")
 
     @staticmethod
     def _vector_literal(vector: List[float]) -> str:
