@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --requirement requirements-dev.txt
+      - run: python -m ruff format --check .
+      - run: python -m ruff check .
+      - run: python -m mypy
+      - run: python -m pytest --cov=mbd_api --cov-report=term-missing
+      - run: python -m pip_audit --requirement requirements.txt
+
+  database:
+    name: Fresh pgvector migration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d app"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGPASSWORD: postgres
+      DATABASE_URL: postgresql://postgres@localhost:5432/app
+    steps:
+      - uses: actions/checkout@v4
+      - run: make db-check
+
+  container:
+    name: Production container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag mbd-api:test .
+      - name: Start and verify health
+        run: |
+          docker run --detach --name mbd-api --publish 8000:8000 \
+            --env APP_ENV=test \
+            --env OPENAI_API_KEY=test-key \
+            --env SUPABASE_URL=http://127.0.0.1:54321 \
+            --env SUPABASE_SERVICE_ROLE_KEY=test-key \
+            --env WIDGET_SIGNING_KEYS=v1:test-signing-key \
+            mbd-api:test
+          for attempt in {1..20}; do
+            curl --fail --silent http://127.0.0.1:8000/healthz && break
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:8000/healthz
+          docker stop --timeout 10 mbd-api
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2

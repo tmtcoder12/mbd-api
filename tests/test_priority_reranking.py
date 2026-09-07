@@ -1,49 +1,10 @@
-import importlib.util
-import pathlib
-import sys
-import types
 import unittest
 
 
 def _load_module():
-    if "numpy" not in sys.modules:
-        try:
-            import numpy as real_np
+    from mbd_api import core
 
-            sys.modules["numpy"] = real_np
-        except ModuleNotFoundError:
-            fake_np = types.ModuleType("numpy")
-            fake_np.array = lambda v, dtype=None: v
-            fake_np.float32 = float
-            fake_np.clip = lambda a, b, c: a
-            fake_np.dot = lambda a, b: sum(float(x) * float(y) for x, y in zip(a, b))
-            fake_np.linalg = types.SimpleNamespace(
-                norm=lambda v, axis=None, keepdims=None: (sum(float(x) * float(x) for x in v) ** 0.5)
-            )
-            sys.modules["numpy"] = fake_np
-    if "dotenv" not in sys.modules:
-        fake_dotenv = types.ModuleType("dotenv")
-        fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-        sys.modules["dotenv"] = fake_dotenv
-    if "openai" not in sys.modules:
-        fake_openai = types.ModuleType("openai")
-        fake_openai.OpenAI = object
-        sys.modules["openai"] = fake_openai
-    if "stripe" not in sys.modules:
-        fake_stripe = types.ModuleType("stripe")
-        fake_stripe.Webhook = types.SimpleNamespace(construct_event=lambda *args, **kwargs: {})
-        fake_stripe.Subscription = types.SimpleNamespace(retrieve=lambda *args, **kwargs: {})
-        sys.modules["stripe"] = fake_stripe
-
-    root = pathlib.Path(__file__).resolve().parents[1]
-    path = root / "rag-chatbot.py"
-    spec = importlib.util.spec_from_file_location("rag_chatbot_priority_reranking_test_module", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load rag-chatbot.py for tests")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return core
 
 
 class _FakeRetriever:

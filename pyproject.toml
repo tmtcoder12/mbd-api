@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=75,<82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mbd-api"
+version = "1.0.0"
+description = "Multi-tenant restaurant RAG chat API and repeatable knowledge-ingestion pipeline"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "numpy>=2.1,<3",
+  "openai>=2.20,<3",
+  "pydantic-settings>=2.7,<3",
+  "python-dotenv>=1.0,<2",
+  "redis>=5.2,<8",
+  "requests>=2.32,<3",
+  "stripe>=11,<15",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.14,<2",
+  "pip-audit>=2.8,<3",
+  "pre-commit>=4,<5",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+  "types-requests>=2.32,<3",
+]
+
+[project.scripts]
+mbd-api = "mbd_api.__main__:main"
+mbd-ingest = "mbd_api.ingest:main"
+
+[tool.setuptools.packages.find]
+include = ["mbd_api*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["mbd_api/core.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["mbd_api"]
+exclude = ["mbd_api/core.py"]
+check_untyped_defs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "mbd_api.core"
+ignore_errors = true

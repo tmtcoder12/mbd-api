@@ -1,44 +1,12 @@
-import importlib.util
-import pathlib
-import sys
 import threading
 import time
-import types
 import unittest
 
 
 def _load_module():
-    if "numpy" not in sys.modules:
-        try:
-            import numpy as real_np
-            sys.modules["numpy"] = real_np
-        except ModuleNotFoundError:
-            fake_np = types.ModuleType("numpy")
-            fake_np.array = lambda v, dtype=None: v
-            fake_np.float32 = float
-            fake_np.clip = lambda a, b, c: a
-            fake_np.dot = lambda a, b: sum(float(x) * float(y) for x, y in zip(a, b))
-            fake_np.linalg = types.SimpleNamespace(
-                norm=lambda v, axis=None, keepdims=None: (sum(float(x) * float(x) for x in v) ** 0.5)
-            )
-            sys.modules["numpy"] = fake_np
-    if "dotenv" not in sys.modules:
-        fake_dotenv = types.ModuleType("dotenv")
-        fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-        sys.modules["dotenv"] = fake_dotenv
-    if "openai" not in sys.modules:
-        fake_openai = types.ModuleType("openai")
-        fake_openai.OpenAI = object
-        sys.modules["openai"] = fake_openai
+    from mbd_api import core
 
-    root = pathlib.Path(__file__).resolve().parents[1]
-    path = root / "rag-chatbot.py"
-    spec = importlib.util.spec_from_file_location("rag_chatbot_module", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load rag-chatbot.py for tests")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return core
 
 
 class _FakeQueryCache:
@@ -132,6 +100,7 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
         orig_embed = mod.embed_query
         orig_create = mod.create_assistant_response
         try:
+
             def _classify(client, model, user_query):
                 classifier_started.set()
                 time.sleep(0.02)
@@ -143,8 +112,10 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
 
             mod.classify_query_cacheability = _classify
             mod.embed_query = _embed
-            mod.create_assistant_response = (
-                lambda *args, **kwargs: ("We close at 10 PM.", "resp1", {"include_images": False, "max_images": 0, "target_item_names": []})
+            mod.create_assistant_response = lambda *args, **kwargs: (
+                "We close at 10 PM.",
+                "resp1",
+                {"include_images": False, "max_images": 0, "target_item_names": []},
             )
             mod.handle_chat_turn(
                 client=object(),
@@ -183,8 +154,10 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
                 {"response_id": "r2", "latency_ms": 1, "raw_output_len": 9},
             )
             mod.embed_query = lambda *args, **kwargs: _Vec([1.0, 0.0])
-            mod.create_assistant_response = (
-                lambda *args, **kwargs: ("We close at 10 PM.", "resp2", {"include_images": False, "max_images": 0, "target_item_names": []})
+            mod.create_assistant_response = lambda *args, **kwargs: (
+                "We close at 10 PM.",
+                "resp2",
+                {"include_images": False, "max_images": 0, "target_item_names": []},
             )
             turn = mod.handle_chat_turn(
                 client=object(),
@@ -223,8 +196,10 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
                 {"response_id": "r3", "latency_ms": 1, "raw_output_len": 13},
             )
             mod.embed_query = lambda *args, **kwargs: _Vec([1.0, 0.0])
-            mod.create_assistant_response = (
-                lambda *args, **kwargs: ("We close at 10 PM.", "resp3", {"include_images": False, "max_images": 0, "target_item_names": []})
+            mod.create_assistant_response = lambda *args, **kwargs: (
+                "We close at 10 PM.",
+                "resp3",
+                {"include_images": False, "max_images": 0, "target_item_names": []},
             )
             mod.handle_chat_turn(
                 client=object(),
@@ -256,14 +231,17 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
         orig_embed = mod.embed_query
         orig_create = mod.create_assistant_response
         try:
+
             def _slow_classify(*args, **kwargs):
                 time.sleep(0.1)
                 return True, "CACHEABLE", {"response_id": "r4", "latency_ms": 100, "raw_output_len": 9}
 
             mod.classify_query_cacheability = _slow_classify
             mod.embed_query = lambda *args, **kwargs: _Vec([1.0, 0.0])
-            mod.create_assistant_response = (
-                lambda *args, **kwargs: ("We close at 10 PM.", "resp4", {"include_images": False, "max_images": 0, "target_item_names": []})
+            mod.create_assistant_response = lambda *args, **kwargs: (
+                "We close at 10 PM.",
+                "resp4",
+                {"include_images": False, "max_images": 0, "target_item_names": []},
             )
             mod.handle_chat_turn(
                 client=object(),
@@ -307,8 +285,10 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
                 return _Vec([1.0, 0.0])
 
             mod.embed_query = _embed
-            mod.create_assistant_response = (
-                lambda *args, **kwargs: ("We close at 10 PM.", "resp-embed", {"include_images": False, "max_images": 0, "target_item_names": []})
+            mod.create_assistant_response = lambda *args, **kwargs: (
+                "We close at 10 PM.",
+                "resp-embed",
+                {"include_images": False, "max_images": 0, "target_item_names": []},
             )
             mod.handle_chat_turn(
                 client=object(),
@@ -361,6 +341,7 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
         classifier_started = threading.Event()
         orig_classify = mod.classify_query_cacheability
         try:
+
             def _slow_classify(*args, **kwargs):
                 classifier_started.set()
                 time.sleep(0.1)
@@ -383,10 +364,10 @@ class QueryCacheLlmGatingTests(unittest.TestCase):
                 request_id="req-exact-hit",
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000
+            self.assertTrue(classifier_started.wait(0.2))
         finally:
             mod.classify_query_cacheability = orig_classify
 
-        self.assertTrue(classifier_started.wait(0.2))
         self.assertTrue(turn.get("cache_hit"))
         self.assertEqual(turn.get("cache_hit_stage"), "exact")
         self.assertLess(elapsed_ms, 80.0)

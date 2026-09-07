@@ -1,12 +1,8 @@
-import importlib.util
 import json
-import pathlib
-import sys
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-
 
 TEST_RESTAURANT_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -32,21 +28,14 @@ def _install_fake_stripe():
 
     fake_stripe.Webhook = _Webhook
     fake_stripe.Subscription = _Subscription
-    sys.modules["stripe"] = fake_stripe
     return fake_stripe
 
 
 def _load_module():
-    _install_fake_stripe()
-    root = pathlib.Path(__file__).resolve().parents[1]
-    path = root / "stripe_billing.py"
-    spec = importlib.util.spec_from_file_location("stripe_billing_test_module", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load stripe_billing.py for tests")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    from mbd_api import billing
+
+    billing.stripe = _install_fake_stripe()
+    return billing
 
 
 class _FakeStore:
@@ -385,7 +374,7 @@ class StripeBillingTests(unittest.TestCase):
         self.assertEqual(store.events["evt_decimal"]["payload"]["data"]["object"]["balance"], "12.34")
 
     def test_subscription_allows_access_when_canceled_but_paid_through_date_is_future(self):
-        future_end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        future_end = (datetime.now(UTC) + timedelta(days=7)).isoformat()
         allowed = self.mod.subscription_allows_api_access(
             status="canceled",
             current_period_end=future_end,
@@ -394,7 +383,7 @@ class StripeBillingTests(unittest.TestCase):
         self.assertTrue(allowed)
 
     def test_subscription_denies_access_when_paid_through_date_has_passed(self):
-        past_end = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        past_end = (datetime.now(UTC) - timedelta(days=1)).isoformat()
         allowed = self.mod.subscription_allows_api_access(
             status="canceled",
             current_period_end=past_end,
@@ -403,8 +392,8 @@ class StripeBillingTests(unittest.TestCase):
         self.assertFalse(allowed)
 
     def test_subscription_denies_access_when_ended_at_has_passed(self):
-        future_end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
-        past_ended = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        future_end = (datetime.now(UTC) + timedelta(days=7)).isoformat()
+        past_ended = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
         allowed = self.mod.subscription_allows_api_access(
             status="canceled",
             current_period_end=future_end,

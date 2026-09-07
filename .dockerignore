@@ -1,0 +1,15 @@
+.git
+.github
+.env
+.venv
+myenv
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+tests
+demo/cedar-and-salt/assets/originals
+

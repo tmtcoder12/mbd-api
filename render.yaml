@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: mbd-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: ALLOW_LOCALHOST_ORIGINS
+        value: "false"
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+      - key: QUERY_CACHE_ENABLED
+        value: "false"
+      - key: STRIPE_WEBHOOKS_ENABLED
+        value: "false"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: WIDGET_SIGNING_KEYS
+        sync: false
