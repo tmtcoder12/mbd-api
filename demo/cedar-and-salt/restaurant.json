@@ -1,0 +1,323 @@
+{
+  "schema_version": 1,
+  "restaurant_id": "11111111-1111-4111-8111-555555555555",
+  "source_name": "cedar-and-salt-portfolio-demo-v1",
+  "chunks": [
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "cedar-plank-salmon",
+      "type": "menu_item",
+      "title": "Cedar-Plank Salmon",
+      "text": "Cedar-Plank Salmon — $32. Wild Pacific salmon with a maple-miso glaze, roasted fingerling potatoes, and charred broccolini. Contains fish and soy. The glaze contains gluten, so the standard preparation is not gluten-free.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/mains/cedar-plank-salmon",
+      "image_path": "assets/cedar-plank-salmon.webp",
+      "metadata": {"item_name": "Cedar-Plank Salmon", "price": 32, "dietary_tags": [], "allergens": ["fish", "soy", "gluten"], "priority_score": 5}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "wild-mushroom-burger",
+      "type": "menu_item",
+      "title": "Wild Mushroom Burger",
+      "text": "Wild Mushroom Burger — $21. A grilled mushroom and lentil patty with alpine cheese, caramelized onions, arugula, and roasted garlic aioli on a brioche bun. Vegetarian. Contains dairy, egg, and gluten; it is not vegan in its standard preparation.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/mains/wild-mushroom-burger",
+      "image_path": "assets/wild-mushroom-burger.webp",
+      "metadata": {"item_name": "Wild Mushroom Burger", "price": 21, "dietary_tags": ["vegetarian"], "allergens": ["dairy", "egg", "gluten"], "priority_score": 4}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "roasted-root-bowl",
+      "type": "menu_item",
+      "title": "Roasted Root Vegetable Bowl",
+      "text": "Roasted Root Vegetable Bowl — $19. Quinoa, roasted carrots and beets, massaged kale, pickled cabbage, pumpkin seeds, and maple-tahini dressing. Vegan and gluten-free. Contains sesame; guests with severe allergies should speak with the restaurant.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/mains/roasted-root-bowl",
+      "image_path": "assets/roasted-root-vegetable-bowl.webp",
+      "metadata": {"item_name": "Roasted Root Vegetable Bowl", "price": 19, "dietary_tags": ["vegan", "gluten-free"], "allergens": ["sesame"], "priority_score": 5}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "dungeness-crab-cakes",
+      "type": "menu_item",
+      "title": "Dungeness Crab Cakes",
+      "text": "Dungeness Crab Cakes — $18. Two pan-seared crab cakes with shaved fennel slaw and lemon aioli. Contains shellfish, egg, and gluten. Served as a starter.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/starters/dungeness-crab-cakes",
+      "image_path": "assets/dungeness-crab-cakes.webp",
+      "metadata": {"item_name": "Dungeness Crab Cakes", "price": 18, "dietary_tags": [], "allergens": ["shellfish", "egg", "gluten"], "priority_score": 4}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "berry-pavlova",
+      "type": "menu_item",
+      "title": "Seasonal Berry Pavlova",
+      "text": "Seasonal Berry Pavlova — $12. Crisp meringue with berry compote, whipped mascarpone, and lemon verbena. Vegetarian and gluten-free. Contains egg and dairy.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/desserts/seasonal-berry-pavlova",
+      "image_path": "assets/seasonal-berry-pavlova.webp",
+      "metadata": {"item_name": "Seasonal Berry Pavlova", "price": 12, "dietary_tags": ["vegetarian", "gluten-free"], "allergens": ["egg", "dairy"], "priority_score": 4}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "spruce-tip-soda",
+      "type": "menu_item",
+      "title": "Spruce Tip & Blackberry Soda",
+      "text": "Spruce Tip & Blackberry Soda — $7. A non-alcoholic house soda with spruce tip syrup, blackberry, lemon, and sparkling water. Vegan and gluten-free. Available during dinner service while the seasonal syrup lasts.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/drinks/spruce-tip-blackberry-soda",
+      "image_path": "assets/spruce-tip-blackberry-soda.webp",
+      "metadata": {"item_name": "Spruce Tip & Blackberry Soda", "price": 7, "dietary_tags": ["vegan", "gluten-free", "non-alcoholic"], "allergens": [], "priority_score": 3}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "smoked-salmon-chowder",
+      "type": "menu_item",
+      "title": "Smoked Salmon Chowder",
+      "text": "Smoked Salmon Chowder — $14. Creamy chowder with house-smoked salmon, corn, leek, potato, and dill oil. Contains fish and dairy. A cup is served with grilled sourdough containing gluten.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/starters/smoked-salmon-chowder",
+      "metadata": {"item_name": "Smoked Salmon Chowder", "price": 14, "dietary_tags": [], "allergens": ["fish", "dairy", "gluten"], "priority_score": 2}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "pacific-oysters",
+      "type": "menu_item",
+      "title": "Pacific Oysters",
+      "text": "Pacific Oysters — $24 for six. Chilled local oysters with apple mignonette, horseradish, and lemon. Gluten-free. Contains shellfish; consuming raw shellfish carries health risks.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/starters/pacific-oysters",
+      "metadata": {"item_name": "Pacific Oysters", "price": 24, "dietary_tags": ["gluten-free"], "allergens": ["shellfish"], "priority_score": 3}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "charred-cabbage",
+      "type": "menu_item",
+      "title": "Charred Cabbage",
+      "text": "Charred Cabbage — $13. Savoy cabbage with sunflower-seed cream, chili crisp, and herbs. Vegan. The chili crisp contains gluten; a gluten-free preparation is not currently offered.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/starters/charred-cabbage",
+      "metadata": {"item_name": "Charred Cabbage", "price": 13, "dietary_tags": ["vegan"], "allergens": ["gluten"], "priority_score": 2}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "sourdough-board",
+      "type": "menu_item",
+      "title": "Sourdough Board",
+      "text": "Sourdough Board — $10. Warm local sourdough with cultured sea-salt butter and roasted garlic. Vegetarian. Contains dairy and gluten.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/starters/sourdough-board",
+      "metadata": {"item_name": "Sourdough Board", "price": 10, "dietary_tags": ["vegetarian"], "allergens": ["dairy", "gluten"], "priority_score": 1}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "herb-roast-chicken",
+      "type": "menu_item",
+      "title": "Herb-Roasted Chicken",
+      "text": "Herb-Roasted Chicken — $28. Half chicken with celery-root purée, roasted mushrooms, chicken jus, and fresh herbs. Gluten-free. Contains dairy and celery.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/mains/herb-roasted-chicken",
+      "metadata": {"item_name": "Herb-Roasted Chicken", "price": 28, "dietary_tags": ["gluten-free"], "allergens": ["dairy", "celery"], "priority_score": 3}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "braised-beef-short-rib",
+      "type": "menu_item",
+      "title": "Braised Beef Short Rib",
+      "text": "Braised Beef Short Rib — $34. Red-wine-braised beef with parsnip purée, glazed carrots, and crispy shallots. Contains dairy, sulphites, and gluten.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/mains/braised-beef-short-rib",
+      "metadata": {"item_name": "Braised Beef Short Rib", "price": 34, "dietary_tags": [], "allergens": ["dairy", "sulphites", "gluten"], "priority_score": 3}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "seared-halibut",
+      "type": "menu_item",
+      "title": "Seared Pacific Halibut",
+      "text": "Seared Pacific Halibut — $36. Halibut with spring pea risotto, asparagus, preserved lemon, and brown butter. Gluten-free. Contains fish and dairy.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/mains/seared-pacific-halibut",
+      "metadata": {"item_name": "Seared Pacific Halibut", "price": 36, "dietary_tags": ["gluten-free"], "allergens": ["fish", "dairy"], "priority_score": 4}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "market-greens",
+      "type": "menu_item",
+      "title": "Market Greens",
+      "text": "Market Greens — $12. Mixed local greens, shaved radish, cucumber, herbs, toasted sunflower seeds, and cider vinaigrette. Vegan and gluten-free.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/sides/market-greens",
+      "metadata": {"item_name": "Market Greens", "price": 12, "dietary_tags": ["vegan", "gluten-free"], "allergens": [], "priority_score": 2}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "sea-salt-fries",
+      "type": "menu_item",
+      "title": "Sea-Salt Fries",
+      "text": "Sea-Salt Fries — $9. Skin-on fries with rosemary sea salt and roasted garlic aioli. Vegetarian and gluten-free by ingredients, but cooked in a shared fryer. Aioli contains egg.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/sides/sea-salt-fries",
+      "metadata": {"item_name": "Sea-Salt Fries", "price": 9, "dietary_tags": ["vegetarian"], "allergens": ["egg", "shared-fryer"], "priority_score": 2}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "roasted-broccolini",
+      "type": "menu_item",
+      "title": "Roasted Broccolini",
+      "text": "Roasted Broccolini — $11. Broccolini with lemon, garlic, chili, and toasted hazelnuts. Vegan and gluten-free. Contains tree nuts.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/sides/roasted-broccolini",
+      "metadata": {"item_name": "Roasted Broccolini", "price": 11, "dietary_tags": ["vegan", "gluten-free"], "allergens": ["tree-nuts"], "priority_score": 1}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "dark-chocolate-torte",
+      "type": "menu_item",
+      "title": "Dark Chocolate Torte",
+      "text": "Dark Chocolate Torte — $13. Flourless dark chocolate torte with espresso crème fraîche and cocoa nib brittle. Vegetarian and gluten-free. Contains dairy and egg.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/desserts/dark-chocolate-torte",
+      "metadata": {"item_name": "Dark Chocolate Torte", "price": 13, "dietary_tags": ["vegetarian", "gluten-free"], "allergens": ["dairy", "egg"], "priority_score": 3}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "apple-sorbet",
+      "type": "menu_item",
+      "title": "Green Apple Sorbet",
+      "text": "Green Apple Sorbet — $9. Dairy-free green apple sorbet with mint and candied ginger. Vegan and gluten-free.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/desserts/green-apple-sorbet",
+      "metadata": {"item_name": "Green Apple Sorbet", "price": 9, "dietary_tags": ["vegan", "gluten-free"], "allergens": [], "priority_score": 2}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "coffee-tea",
+      "type": "menu_item",
+      "title": "Coffee and Tea",
+      "text": "Drip coffee is $4, espresso is $4, and a pot of loose-leaf tea is $6. Oat milk is available at no extra charge. Ask the server for the current tea selection.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/drinks/coffee-tea",
+      "metadata": {"item_name": "Coffee and Tea", "dietary_tags": ["vegan-option"], "allergens": []}
+    },
+    {
+      "source_key": "spring-menu-2026",
+      "external_id": "wine-beer",
+      "type": "menu_section",
+      "title": "Wine and Beer",
+      "text": "Cedar & Salt offers a rotating selection of British Columbia wine and craft beer. Glasses of wine start at $12 and draft beer starts at $8. Specific producers and availability change; ask the restaurant for the current list.",
+      "source_url": "https://cedar-and-salt.example/menu",
+      "page_path": "/menu/drinks/wine-beer",
+      "metadata": {"item_name": "Wine and Beer", "allergens": ["alcohol"]}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "hours-dinner",
+      "type": "operations",
+      "title": "Dinner Hours",
+      "text": "Dinner hours are Tuesday through Thursday from 5:00 PM to 10:00 PM, Friday and Saturday from 5:00 PM to 11:00 PM, and Sunday from 5:00 PM to 9:00 PM. Cedar & Salt is closed on Mondays.",
+      "source_url": "https://cedar-and-salt.example/visit",
+      "page_path": "/visit/hours",
+      "metadata": {"topic": "hours"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "hours-kitchen",
+      "type": "operations",
+      "title": "Kitchen Closing Times",
+      "text": "The kitchen accepts its final food orders 30 minutes before the published closing time. The bar may continue service until closing. Holiday hours can differ and should be confirmed directly.",
+      "source_url": "https://cedar-and-salt.example/visit",
+      "page_path": "/visit/hours",
+      "metadata": {"topic": "hours"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "location-transit",
+      "type": "operations",
+      "title": "Location and Transit",
+      "text": "Cedar & Salt is a fictional portfolio restaurant located at 1280 Seawall Avenue, Vancouver, BC. It is a five-minute walk from Harbour Station and is served by the number 19 bus.",
+      "source_url": "https://cedar-and-salt.example/visit",
+      "page_path": "/visit/location",
+      "metadata": {"topic": "location"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "parking",
+      "type": "operations",
+      "title": "Parking",
+      "text": "Metered street parking is available nearby. A paid underground parkade is located one block east at Harbour Station. Cedar & Salt does not validate parking.",
+      "source_url": "https://cedar-and-salt.example/visit",
+      "page_path": "/visit/parking",
+      "metadata": {"topic": "parking"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "reservations",
+      "type": "operations",
+      "title": "Reservations",
+      "text": "Reservations are accepted online for parties of one to six up to 30 days in advance. A limited number of bar seats are held for walk-in guests. Same-day availability changes and cannot be guaranteed by the assistant.",
+      "source_url": "https://cedar-and-salt.example/reservations",
+      "page_path": "/reservations",
+      "metadata": {"topic": "reservations"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "large-parties",
+      "type": "operations",
+      "title": "Large Parties",
+      "text": "Parties of seven to twelve must contact the restaurant directly. A family-style set menu may be required. Cedar & Salt does not accept groups larger than twelve in the main dining room.",
+      "source_url": "https://cedar-and-salt.example/reservations",
+      "page_path": "/reservations/groups",
+      "metadata": {"topic": "large-parties"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "pickup-delivery",
+      "type": "operations",
+      "title": "Pickup and Delivery",
+      "text": "Online pickup is available Tuesday through Sunday from 5:00 PM to 8:30 PM. Cedar & Salt does not currently offer delivery. Not every dine-in item is available for pickup.",
+      "source_url": "https://cedar-and-salt.example/order",
+      "page_path": "/order",
+      "metadata": {"topic": "ordering"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "accessibility",
+      "type": "operations",
+      "title": "Accessibility",
+      "text": "The entrance, dining room, and washroom are wheelchair accessible. Guests who need a lower table or extra maneuvering space can add a note to their reservation.",
+      "source_url": "https://cedar-and-salt.example/visit",
+      "page_path": "/visit/accessibility",
+      "metadata": {"topic": "accessibility"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "allergy-policy",
+      "type": "dietary_policy",
+      "title": "Allergy Policy",
+      "text": "Cedar & Salt identifies common allergens in menu descriptions, but the kitchen handles gluten, dairy, egg, soy, sesame, tree nuts, fish, and shellfish. Cross-contact is possible. Guests with severe allergies must notify the restaurant before ordering; the assistant cannot guarantee allergen-free preparation.",
+      "source_url": "https://cedar-and-salt.example/menu/dietary",
+      "page_path": "/menu/dietary",
+      "metadata": {"topic": "allergies"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "payments-gratuity",
+      "type": "operations",
+      "title": "Payments and Gratuity",
+      "text": "Cedar & Salt accepts major credit cards, debit cards, and cash. Bills can be split across up to four payments. An 18% gratuity is added to parties of seven or more.",
+      "source_url": "https://cedar-and-salt.example/visit",
+      "page_path": "/visit/policies",
+      "metadata": {"topic": "payments"}
+    },
+    {
+      "source_key": "restaurant-operations-2026",
+      "external_id": "gift-cards",
+      "type": "operations",
+      "title": "Gift Cards",
+      "text": "Digital gift cards are available in amounts from $25 to $250 and do not expire. Gift cards can be used for dine-in meals but cannot be redeemed for cash.",
+      "source_url": "https://cedar-and-salt.example/gift-cards",
+      "page_path": "/gift-cards",
+      "metadata": {"topic": "gift-cards"}
+    }
+  ]
+}
