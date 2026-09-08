@@ -1,301 +1,220 @@
-# mbd-api Backend (API-only)
+# MBD API — Multilingual RAG Chatbot
 
-This repository contains the API backend extracted from `multi-bot-datastore`.  
-It serves a restaurant-focused RAG chatbot over HTTP with:
+MBD API is a production-style backend for adding a multilingual, knowledge-grounded chatbot to a website.
 
-- chunked NDJSON streaming responses
-- signed widget token issuance + verification
-- origin allowlist enforcement
-- per-IP and per-session rate limiting
-- Stripe-backed subscription gating for restaurant access
-- optional Supabase-backed chat persistence + retrieval
+It solves a common problem: users want direct answers, but an organization's useful information is spread across menus, product catalogs, policies, FAQs, and other documents. A general chatbot may answer fluently while inventing details. This project uses retrieval-augmented generation (RAG) to find relevant source material first, then asks an LLM to answer from that context.
 
-## Project Files
+The architecture can support many knowledge-based assistants. The included reference implementation uses restaurants as its tenant model and ships with a fictional **Cedar & Salt** dataset.
 
-- `rag-chatbot.py`: main server + request handling + RAG orchestration
-- `supabase_store.py`: Supabase PostgREST/RPC adapter
-- `requirements.txt`: Python dependencies
-- `Dockerfile`: container build definition
+## What it provides
 
-## Runtime Overview
+- Multilingual chat in Mandarin, English, French, Hindi, Japanese, Korean, and Spanish
+- Tenant-isolated vector search with Supabase PostgreSQL and pgvector
+- Streaming NDJSON responses for a responsive web widget
+- Persistent sessions and follow-up context
+- Repeatable, transactional knowledge ingestion
+- Origin-bound widget tokens and per-tenant access controls
+- Optional Redis caching and distributed rate limiting
+- Optional Stripe webhook processing
+- A Docker image, Render Blueprint, and GitHub Actions checks
 
-The server is built on Python’s `ThreadingHTTPServer` and exposes:
+## Architecture
 
-- `GET /healthz`
-- `POST /api/stripe/webhook`
-- `POST /api/widget-token`
-- `POST /api/chat-stream`
-
-High-level request flow:
-
-1. Validate request body and headers (`Origin`, required fields).
-2. Validate `restaurantId`, confirm the restaurant has an active Stripe subscription, and load restaurant security settings from Supabase.
-3. Enforce origin allowlist for that restaurant.
-4. Enforce rate limits (token issuance, IP, session).
-5. For chat: verify `widgetToken` (HS256, `kid`, `rid`, `orig`, `exp`).
-6. Resolve session language (`language` payload -> stored session language -> `eng`) and apply it to the restaurant system prompt.
-7. Retrieve relevant chunks from Supabase pgvector.
-8. Stream model deltas as NDJSON chunked transfer.
-9. Optionally persist session/messages/sources to Supabase.
-
-## API Endpoints
-
-### `GET /healthz`
-
-Returns service health.
-
-Response:
-
-```json
-{ "ok": true }
+```mermaid
+flowchart LR
+    W[Website widget] -->|widget token + chat| A[FastAPI]
+    A --> G[Access and security checks]
+    G --> S[(Supabase)]
+    A --> R[RAG chat service]
+    R --> V[(pgvector knowledge)]
+    R --> O[OpenAI API]
+    R --> S
+    A -. optional .-> C[(Redis)]
+    A -. optional .-> B[Stripe]
 ```
 
-### `POST /api/widget-token`
+A typical chat request follows this path:
 
-Issues a short-lived signed widget JWT bound to:
+1. Validate the body, origin, tenant, subscription, rate limit, and widget token.
+2. Restore or create the multilingual chat session.
+3. Embed the question and retrieve tenant-scoped knowledge from pgvector.
+4. Generate an answer using only the retrieved context.
+5. Stream text and optional image events to the widget.
+6. Persist the updated session and message metadata.
 
-- `restaurantId` (`rid` claim)
-- request `Origin` header (`orig` claim)
+Important modules:
 
-Required:
+| Path | Responsibility |
+| --- | --- |
+| `mbd_api/app.py` | FastAPI application, middleware, and routes |
+| `mbd_api/service.py` | Chat workflow and access enforcement |
+| `mbd_api/rag.py` | Retrieval and response orchestration |
+| `mbd_api/security.py` | Widget-token and session security |
+| `mbd_api/caching.py` | In-memory and optional Redis controls |
+| `mbd_api/repository.py` | Supabase PostgREST and RPC client |
+| `mbd_api/ingest.py` | Repeatable knowledge-ingestion CLI |
+| `supabase/migrations/` | Fresh database schema and RLS policies |
+| `demo/cedar-and-salt/` | Example manifest and original demo imagery |
 
-- `Origin` header
-- JSON body:
+`rag-chatbot.py`, `supabase_store.py`, and `stripe_billing.py` remain as compatibility entrypoints.
 
-```json
-{
-  "restaurantId": "11111111-1111-1111-1111-111111111111"
-}
-```
+## Security decisions
 
-Success response:
+- Widget tokens are signed with HS256 and bound to a tenant, browser origin, and short expiry.
+- Tenant subscription, origin, token, session, and vector filters are checked on every chat request.
+- Supabase uses row-level security. Runtime tables and ingestion RPCs are available only to the backend service role.
+- The service-role key is never sent to the browser.
+- Requests are limited to 64 KiB and messages to 4,000 characters by default.
+- Rate limits apply per client IP and per session. Redis is optional; one Uvicorn worker uses an in-memory limiter by default.
+- Forwarded IP headers are ignored unless proxy trust is explicitly enabled.
+- Client errors are sanitized and include a request ID for log correlation.
+- `/readyz` checks required Supabase access without calling OpenAI.
+- Production startup rejects missing secrets, weak signing keys, invalid Stripe settings, and contradictory cache settings.
 
-```json
-{
-  "widgetToken": "<jwt>",
-  "expiresAt": 1760000000
-}
-```
+The demo subscription is seeded locally so access checks remain active. There is no demo bypass.
 
-Requests are rejected with `403` when the restaurant does not have an active Stripe subscription in Supabase.
+## Local quick start
 
-### `POST /api/stripe/webhook`
+### Prerequisites
 
-Receives Stripe webhook events for subscription lifecycle updates.
+- Python 3.12 or 3.13
+- Docker
+- Supabase CLI
+- An OpenAI API key
 
-Supported event types:
-
-- `checkout.session.completed`
-- `customer.subscription.created`
-- `customer.subscription.updated`
-- `customer.subscription.deleted`
-
-Requirements:
-
-- `Stripe-Signature` header
-- raw request body exactly as sent by Stripe
-
-Integration contract:
-
-- Stripe Payment Link URLs must be distributed with `client_reference_id=<restaurant_uuid>` appended
-- `checkout.session.completed` uses that `client_reference_id` to map the Stripe checkout back to `public.restaurants.id`
-
-The webhook persists Stripe identifiers and subscription status into Supabase so only restaurants with an `active` subscription can access chat endpoints.
-
-### `POST /api/chat-stream`
-
-Streams chatbot output as `application/x-ndjson` with `Transfer-Encoding: chunked`.
-
-Required:
-
-- `Origin` header
-- JSON body:
-
-```json
-{
-  "message": "What are your most popular dishes?",
-  "restaurantId": "11111111-1111-1111-1111-111111111111",
-  "sessionToken": "22222222-2222-2222-2222-222222222222",
-  "newSession": false,
-  "widgetToken": "<jwt from /api/widget-token>",
-  "language": "eng"
-}
-```
-
-`sessionToken` is optional; if omitted, server generates one and sends it in first stream event.
-`newSession` is optional; send `true` only for the first message after the UI starts a fresh chat. The backend will ignore any supplied `sessionToken`, create a new persisted chat session, and stream the new token back for follow-up messages in that chat.
-`language` is optional; when omitted, the backend uses the stored session language or defaults to `eng`.
-
-Streaming event types:
-
-- `{"type":"session","sessionToken":"...","restaurantId":"...","generated":true|false}`
-- `{"type":"delta","content":"..."}`
-- `{"type":"images","images":[{"chunk_id":"...","title":"...","image_url":"...","score":0.0}]}` (optional, model-driven image decision)
-- `{"type":"done"}`
-- `{"type":"error","message":"..."}`
-
-## Environment Variables
-
-### Required
-
-- `OPENAI_API_KEY`
-- `STRIPE_SECRET_KEY`
-- `STRIPE_WEBHOOK_SECRET`
-- `WIDGET_SIGNING_KEYS`  
-  Format: JSON object (`{"v1":"secret1","v2":"secret2"}`) or CSV (`v1:secret1,v2:secret2`)
-- `WIDGET_ACTIVE_KID` (must exist in `WIDGET_SIGNING_KEYS`)
-
-### Retrieval / persistence
-
-- `CHAT_PERSISTENCE=true|false` (default: `true`)
-- `SUPABASE_URL` (required)
-- `SUPABASE_SERVICE_ROLE_KEY` (required)
-
-### Retrieval tuning
-
-- `MIN_SCORE_DEFAULT` (default `0.0`)
-- `QUERY_CLASSIFIER_MODEL` (default `gpt-5-mini`)
-
-### Origin policy
-
-- `ALLOW_LOCALHOST_ORIGINS=true|false` (default: `true`)
-
-### Rate limiting defaults (used when per-restaurant settings are absent)
-
-- `RATE_LIMIT_REQUESTS_PER_MINUTE` (IP limit, default: `30`)
-- `RATE_LIMIT_WINDOW_SECONDS` (IP window, default: `60`)
-- `SESSION_RATE_LIMIT_REQUESTS_PER_MINUTE` (default: `45`)
-- `SESSION_RATE_LIMIT_WINDOW_SECONDS` (default: `60`)
-- `TOKEN_ISSUE_RATE_LIMIT_REQUESTS_PER_MINUTE` (default: `30`)
-- `TOKEN_ISSUE_RATE_LIMIT_WINDOW_SECONDS` (default: `60`)
-- `WIDGET_TOKEN_MAX_AGE_SECONDS` (default: `900`)
-
-### Optional distributed limiter
-
-- `RATE_LIMIT_REDIS_URL`  
-  If set, Redis sliding-window limiter is used; otherwise in-memory limiter is used.
-
-### Optional query cache (Redis)
-
-- `QUERY_CACHE_ENABLED` (default: `true` when a Redis URL is available)
-- `QUERY_CACHE_REDIS_URL` (defaults to `RATE_LIMIT_REDIS_URL` when omitted)
-- `QUERY_CACHE_TTL_SECONDS` (default: `900`)
-- `QUERY_CACHE_NAMESPACE` (default: `qcache:v1`)
-- `QUERY_CACHE_SEMANTIC_THRESHOLD` (default: `0.8`)
-- `QUERY_CACHE_SEMANTIC_MAX_CANDIDATES` (default: `200`)
-- `QUERY_CACHE_REQUIRE_RESTAURANT_RELEVANCE` (default: `true`)
-- `QUERY_CACHE_CLASSIFIER_MODEL` (default: `gpt-5-nano`)
-- `QUERY_CACHE_CLASSIFIER_TIMEOUT_MS` (default: `250`)
-
-When query caching is enabled, eligible requests use staged matching:
-exact query -> normalized query -> semantic similarity -> normal LLM flow.
-
-Eligibility excludes follow-up/reference-style turns. On cache misses, store decisions are gated by an LLM query classifier (`CACHEABLE` vs `NOT_CACHEABLE`).
-
-## Retrieval Backend
-
-Retrieval is Supabase-only and uses RPC `match_chunks` via `supabase_store.py`.  
-`restaurantId` is required on each chat request.
-
-## Supabase Integration
-
-`supabase_store.py` calls PostgREST and RPC endpoints for:
-
-- origin + restaurant validation
-- active subscription validation
-- security settings lookup
-- Stripe subscription upsert + lookup
-- Stripe webhook idempotency logging
-- audit events
-- session upsert
-- session state persistence (`chat_session_state`)
-- chat message persistence
-- async query classification writeback (`chat_messages.query_type`)
-- vector retrieval (`match_chunks`)
-- ingest run/chunk upserts (utility methods)
-
-Expected backend tables/RPC include (at minimum):
-
-- `restaurants`
-- `restaurant_subscriptions`
-- `restaurant_allowed_origins`
-- `restaurant_security_settings`
-- `stripe_webhook_events`
-- `audit_events`
-- `chat_sessions`
-- `chat_session_state`
-- `chat_messages`
-- SQL function: `restaurant_has_active_subscription`
-- SQL function: `user_can_access_active_restaurant`
-- RPC: `upsert_session`, `match_chunks`
-
-## Migrations
-
-Apply migrations:
+### 1. Install the project
 
 ```bash
-psql "$DATABASE_URL" -f supabase/migrations/20260402_stripe_subscriptions.sql
-psql "$DATABASE_URL" -f migrations/20260317_chat_session_state.sql
-psql "$DATABASE_URL" -f migrations/20260328_chat_session_language.sql
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+test -f .env || cp .env.example .env
 ```
 
-## Run Locally
+Add your OpenAI key to `.env`.
 
-Install:
+### 2. Start the local database
 
 ```bash
-pip install -r requirements.txt
+supabase start
+supabase status
 ```
 
-Run server:
+The first command applies the migration and `supabase/seed.sql`. Copy the reported API URL and service-role key into these `.env` values:
+
+```dotenv
+SUPABASE_URL=http://127.0.0.1:54321
+SUPABASE_SERVICE_ROLE_KEY=<local-service-role-key>
+```
+
+### 3. Load the demo knowledge
+
+Serve repository assets in one terminal:
 
 ```bash
-python rag-chatbot.py serve 8 8000
+python -m http.server 5173
 ```
 
-Health check:
+Validate and ingest the Cedar & Salt manifest in another terminal:
+
+```bash
+python -m mbd_api.ingest \
+  --manifest demo/cedar-and-salt/restaurant.json \
+  --asset-base-url http://localhost:5173/demo/cedar-and-salt \
+  --dry-run
+
+python -m mbd_api.ingest \
+  --manifest demo/cedar-and-salt/restaurant.json \
+  --asset-base-url http://localhost:5173/demo/cedar-and-salt \
+  --prune
+```
+
+`--prune` is always explicit. Without it, ingestion never removes existing source rows.
+
+### 4. Start the API and demo
+
+```bash
+make serve
+```
+
+Verify the service:
 
 ```bash
 curl http://localhost:8000/healthz
+curl -i http://localhost:8000/readyz
 ```
 
-## Security Notes
+Open [http://localhost:5173/chat-ui-ref-files/](http://localhost:5173/chat-ui-ref-files/) to use the widget.
 
-- Chat calls are blocked without valid `widgetToken`.
-- Tokens are origin-bound and restaurant-bound.
-- Expiry is enforced and capped by max age.
-- Origin allowlist is enforced per restaurant.
-- Audit events are written on origin/rate-limit violations when Supabase is configured.
+## Ingestion design
 
-## Operational Notes
+The supported interface is:
 
-- Streaming format is NDJSON over chunked HTTP/1.1.
-- Request IDs are returned in `X-Request-Id`.
-- Debug timing logs are enabled (`DEBUG_TIMINGS = True` in code).
-- The `Dockerfile` currently starts `backend/rag-chatbot.py`; in this repo layout, the script is at repo root (`rag-chatbot.py`), so update container command if needed.
+```text
+python -m mbd_api.ingest --manifest <file> [--asset-base-url <url>] [--batch-size N] [--prune] [--dry-run]
+```
 
+Manifests use JSON schema version 1. Each chunk has a stable `source_key` and `external_id`, content, optional source metadata, and an optional image path or URL.
 
-## Example Usage: 
+The pipeline:
 
-Health check: curl -i https://mbd-api.onrender.com/healthz
+- creates deterministic chunk IDs;
+- compares content hashes and skips unchanged embeddings;
+- batches `text-embedding-3-small` embeddings at 1,536 dimensions;
+- uploads rows to a service-role-only staging table;
+- validates and activates a complete run in one transaction;
+- leaves active knowledge unchanged if staging or validation fails;
+- prints a machine-readable JSON summary.
 
-Request Widget Token: 
-curl -sS -X POST https://mbd-api.onrender.com/api/widget-token \
-  -H "Content-Type: application/json" \
-  -H "Origin: http://localhost:8000" \ 
-  -d "{\"restaurantId\":\"$RID\"}"
+Relative image paths require `--asset-base-url` so stored URLs work outside the repository.
 
-NOTE: In testing and dev, the origin will be local host. In production, that will be the restaurants website. 
+## API
 
-Call Chat Stream: 
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/healthz` | Process health |
+| `GET` | `/readyz` | Required dependency readiness |
+| `POST` | `/api/widget-token` | Issue an origin- and tenant-bound widget token |
+| `POST` | `/api/chat-stream` | Stream chat events as `application/x-ndjson` |
+| `POST` | `/api/stripe/webhook` | Process subscription events when enabled |
 
-WIDGET_TOKEN="<paste token from step 2>"
+The chat stream preserves these event types:
 
-curl -N -X POST https://mbd-api.onrender.com/api/chat-stream \
-  -H "Content-Type: application/json" \
-  -H "Origin: $ORIGIN" \
-  -d "{
-    \"message\":\"What are your most popular dishes?\",
-    \"restaurantId\":\"$RID\",
-    \"widgetToken\":\"$WIDGET_TOKEN\"
-  }"
+```text
+session -> delta* -> images? -> done
+                         \-> error
+```
+
+The public API currently uses `restaurantId` as the tenant identifier. A broader deployment can rename this domain concept while keeping the same access and RAG architecture.
+
+## Configuration
+
+See `.env.example` for every setting. Required runtime values are:
+
+- `OPENAI_API_KEY`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `WIDGET_SIGNING_KEYS`, such as `v1:<random-secret>`
+- `WIDGET_ACTIVE_KID`, which must match a configured key
+
+Optional infrastructure is disabled by default:
+
+- `QUERY_CACHE_ENABLED=false`: Redis query caching is off.
+- `RATE_LIMIT_REDIS_URL=`: the service uses its in-memory limiter.
+- `STRIPE_WEBHOOKS_ENABLED=false`: the webhook returns a stable `503`; subscription checks still run.
+
+For production, use a random signing secret of at least 32 characters, disable localhost origins, register the real website origin in Supabase, and enable proxy trust only behind a known proxy such as Render.
+
+## Quality and deployment
+
+```bash
+make test        # unit and HTTP tests
+make lint        # Ruff format and lint checks
+make typecheck   # mypy
+make audit       # dependency vulnerability audit
+make docker-build
+```
+
+GitHub Actions runs tests on Python 3.12 and 3.13, applies the migration to an empty pgvector database, audits dependencies, scans for secrets, and verifies the production Docker build.
+
+The Docker image runs as a non-root user with one Uvicorn worker. `render.yaml` contains a credential-free Render deployment definition; secrets are entered during deployment rather than stored in Git.
