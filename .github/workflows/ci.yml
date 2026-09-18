@@ -90,3 +90,9 @@ jobs:
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
+      - name: Scan complete Git history
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/repo:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.24.3 \
+            git --redact --log-opts=--all /repo
