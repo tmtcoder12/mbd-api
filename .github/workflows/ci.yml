@@ -8,10 +8,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +37,7 @@ jobs:
   database:
     name: Fresh pgvector migration
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -55,28 +61,30 @@ jobs:
   container:
     name: Production container
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: docker build --tag mbd-api:test .
+      - run: docker build --tag mintgen-api:test .
       - name: Start and verify health
         run: |
-          docker run --detach --name mbd-api --publish 8000:8000 \
+          docker run --detach --name mintgen-api --publish 8000:8000 \
             --env APP_ENV=test \
             --env OPENAI_API_KEY=test-key \
             --env SUPABASE_URL=http://127.0.0.1:54321 \
             --env SUPABASE_SERVICE_ROLE_KEY=test-key \
             --env WIDGET_SIGNING_KEYS=v1:test-signing-key \
-            mbd-api:test
+            mintgen-api:test
           for attempt in {1..20}; do
             curl --fail --silent http://127.0.0.1:8000/healthz && break
             sleep 1
           done
           curl --fail http://127.0.0.1:8000/healthz
-          docker stop --timeout 10 mbd-api
+          docker stop --timeout 10 mintgen-api
 
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:

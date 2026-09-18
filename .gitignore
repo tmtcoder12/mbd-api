@@ -11,6 +11,8 @@ __pycache__/
 .coverage
 htmlcov/
 *.egg-info/
+build/
+dist/
 supabase/*
 !supabase/config.toml
 !supabase/seed.sql

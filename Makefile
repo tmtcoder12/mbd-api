@@ -36,7 +36,6 @@ db-check:
 	psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f supabase/seed.sql
 
 docker-build:
-	docker build --tag mbd-api:local .
+	docker build --tag mintgen-api:local .
 
 check: lint typecheck test audit docker-build
-

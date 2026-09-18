@@ -3,11 +3,19 @@ requires = ["setuptools>=75,<82"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mbd-api"
+name = "mintgen-api"
 version = "1.0.0"
-description = "Multi-tenant restaurant RAG chat API and repeatable knowledge-ingestion pipeline"
+description = "Tenant-isolated multilingual RAG API and transactional knowledge-ingestion pipeline"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
+keywords = ["fastapi", "multilingual", "pgvector", "rag", "supabase"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "fastapi>=0.115,<1",
   "numpy>=2.1,<3",
@@ -33,8 +41,14 @@ dev = [
 ]
 
 [project.scripts]
+mintgen-api = "mbd_api.__main__:main"
+mintgen-ingest = "mbd_api.ingest:main"
 mbd-api = "mbd_api.__main__:main"
 mbd-ingest = "mbd_api.ingest:main"
+
+[project.urls]
+Repository = "https://github.com/tmtcoder12/mbd-api"
+Issues = "https://github.com/tmtcoder12/mbd-api/issues"
 
 [tool.setuptools.packages.find]
 include = ["mbd_api*"]

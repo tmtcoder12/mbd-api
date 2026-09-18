@@ -148,7 +148,7 @@ class AssistantStreamingTests(unittest.TestCase):
         self.assertEqual("".join(emitted), "Answer text")
         self.assertEqual(assistant_text, "Answer text")
         self.assertTrue(image_decision["include_images"])
-        self.assertNotIn("MBD_IMAGE_DECISION", "".join(emitted))
+        self.assertNotIn("MINTGEN_IMAGE_DECISION", "".join(emitted))
 
     def test_create_assistant_response_streams_one_openai_request(self):
         text = (

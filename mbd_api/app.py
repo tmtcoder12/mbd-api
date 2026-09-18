@@ -57,7 +57,7 @@ def create_app(settings: Settings | None = None, services: ApplicationServices |
                 runtime_services.close()
             logger.info("Application stopped", extra={"event": "shutdown"})
 
-    app = FastAPI(title="MBD Restaurant RAG API", version=__version__, lifespan=lifespan)
+    app = FastAPI(title="MintGen API", version=__version__, lifespan=lifespan)
 
     @app.middleware("http")
     async def request_context(request: Request, call_next: Any) -> Response:

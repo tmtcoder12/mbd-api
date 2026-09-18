@@ -9,7 +9,7 @@ import uvicorn
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the MBD Restaurant RAG API")
+    parser = argparse.ArgumentParser(description="Run the MintGen multilingual RAG API")
     parser.add_argument("command", nargs="?", default="serve", choices=["serve"])
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))

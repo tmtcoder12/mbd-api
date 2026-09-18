@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: mbd-api
+    name: mintgen-api
     runtime: docker
     plan: free
     healthCheckPath: /healthz
@@ -24,3 +24,5 @@ services:
         sync: false
       - key: WIDGET_SIGNING_KEYS
         sync: false
+      - key: WIDGET_ACTIVE_KID
+        value: v1

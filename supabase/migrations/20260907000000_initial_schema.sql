@@ -1,4 +1,4 @@
--- Fresh-project schema for the MBD Restaurant RAG API.
+-- Fresh-project schema for the MintGen multilingual RAG API.
 -- Designed for Supabase Postgres 17 with pgvector.
 
 create schema if not exists extensions;

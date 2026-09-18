@@ -1,6 +1,8 @@
-# MintGen — Multilingual RAG for Restaurants
+# MBD — MintGen Restaurant AI Backend
 
-MintGen is a multilingual, knowledge-grounded assistant that helps restaurant guests get useful answers without waiting for a staff member. It combines a customer-facing chat widget with a companion analytics dashboard.
+[![CI](https://github.com/tmtcoder12/mbd-api/actions/workflows/ci.yml/badge.svg)](https://github.com/tmtcoder12/mbd-api/actions/workflows/ci.yml)
+
+`mbd-api` is the API and guest-widget repository for **MintGen**, a multilingual, knowledge-grounded restaurant assistant. MintGen helps guests get useful answers without waiting for a staff member and includes a companion analytics dashboard maintained separately.
 
 ## Why I built MintGen
 
@@ -93,7 +95,7 @@ Key modules:
 | `supabase/migrations/` | Database schema and RLS policies |
 | `demo/cedar-and-salt/` | Fictional demo manifest and imagery |
 
-`rag-chatbot.py`, `supabase_store.py`, and `stripe_billing.py` remain as compatibility entrypoints.
+The Python import path remains `mbd_api` for backward compatibility. `rag-chatbot.py`, `supabase_store.py`, and `stripe_billing.py` are also retained as compatibility entrypoints.
 
 ## Security decisions
 
